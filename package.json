@@ -4,8 +4,7 @@
   "type": "module",
   "main": "Index.js",
   "scripts": {
-    "start": "node --import ./server.js Index.js",
-    "engines": { "node": ">=18" },
+    "start": "node Index.js",
     "test": "node --test"
   },
   "dependencies": {
