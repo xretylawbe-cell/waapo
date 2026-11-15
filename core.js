@@ -859,6 +859,7 @@ export function resolveTargets(uid, t = {}) {
   if (t.kind === 'numbers') (t.numbers || []).forEach(addNum);
   else if (t.kind === 'list') (load(uid, 'lists', {})[t.name] || []).forEach(addNum);
   else if (t.kind === 'groups') { const G = load(uid, 'groups', {}); (t.ids || []).filter(id => G[id]).forEach(id => res.push({ jid: id, kind: 'group' })); }
+  else if (t.kind === 'grouplist') { const G = load(uid, 'groups', {}); (load(uid, 'grouplists', {})[t.name] || []).filter(id => G[id]).forEach(id => res.push({ jid: id, kind: 'group' })); }
   else if (t.kind === 'channels') { const H = load(uid, 'channels', {}); (t.ids || []).filter(id => H[id]).forEach(id => res.push({ jid: id, kind: 'channel' })); }
   const seen = new Set(); return res.filter(x => !seen.has(x.jid) && seen.add(x.jid));
 }

@@ -4,6 +4,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { Telegraf, Markup } from 'telegraf';
 import * as W from './core.js';
+import { startApi } from './api.js';
 const { CFG, load, save, prof, udir, users, hooks, fmt } = W;
 
 if (!CFG.token) throw new Error('BOT_TOKEN is required to start the Telegram bot.');
@@ -29,7 +30,10 @@ const packRows = rows => {                         // reflow into neat, short ro
   return [...res, ...nav];
 };
 const kb = rows => {
-  const shown = packRows(rows).map(row => row.map(label => { const style = styleFor(label); return style ? { text: label, style } : label; }));
+  const shown = packRows(rows).map(row => row.map(label => {
+    if (label === '📱 Open app' && process.env.MINIAPP_URL) return { text: label, web_app: { url: process.env.MINIAPP_URL } };   // opens the Mini App inside Telegram
+    const style = styleFor(label); return style ? { text: label, style } : label;
+  }));
   let k = Markup.keyboard(shown).resize();
   if (W.CFG.kbPinned !== false) k = k.persistent();           // admin toggle: pinned = always open, unpinned = can be collapsed
   return k.placeholder('Use the menu ↓');
@@ -102,6 +106,7 @@ const phone = n => '+' + n;
 const state = u => !W.linked(u) ? 'new' : (W.expired(prof(u)) && !isAdm(u)) ? 'expired' : 'ok';
 // ---------- who can see/do what ----------
 const FEATURES = {
+  app: { name: 'Mini App button', def: true, labels: ['📱 Open app'] },
   profile: { name: 'Profile', def: true, labels: ['👤 Profile'] },
   post: { name: 'Posting', def: true, labels: ['✍️ Post', '📝 Text', '🖼 Image', '🎬 Video', '🎵 Audio'] },
   queue: { name: 'Queue many', def: true, labels: ['🗂 Queue many'] },
@@ -119,7 +124,7 @@ const FEATURES = {
   insights: { name: 'Insights', def: true, labels: ['📊 Insights', '📈 Stats', '⏰ Best hours', '🏆 Best posts', '📰 Weekly report'] },
   plan: { name: 'Plans & payment', def: true, labels: ['💳 Plan', '📄 My plan', '🛒 Choose a plan', '🧾 Send receipt', '💳 Pay'] },
   inbox: { name: 'Inbox & support', def: true, labels: ['📩 Inbox', '📌 Notices', '✉️ Message admin'] },
-  msgs: { name: 'Messages (numbers, lists, groups, channels)', def: false, labels: ['✉️ Messages', '✉️ New message', '📋 Scheduled messages', '📺 My channels'] },
+  msgs: { name: 'Messages (numbers, lists, groups, channels)', def: false, labels: ['✉️ Messages', '✉️ New message', '📋 Scheduled messages', '📺 My channels', '📚 Group lists', '➕ New group list', '➕ Add groups to a list', '➖ Remove from a list', '📖 View group lists', '🗑 Delete group list', '📚 A group list'] },
   reach: { name: 'Reach-out messages', def: false, labels: ['📣 Reach out', '🔛 Reach-out on/off', '📊 Reach-out stats', '✏️ Reach-out messages', '🔢 Reach-out per day'] },
   unsend: { name: 'Delete sent posts', def: true, labels: ['🗑 Delete a sent post'] },
   referral: { name: 'Referrals', def: true, labels: ['🎁 Refer a friend'] },
@@ -160,6 +165,7 @@ const refreshMenus = () => { for (const k of Object.keys(ST)) { ST[k].keyboardRo
 const MENUS = {
   home: { t: '🏠 Main menu', rows: u => {
     const s = state(u), r = [];
+    if (process.env.MINIAPP_URL) r.push(['📱 Open app']);
     if (s === 'new') r.push(['📲 Link WhatsApp']);
     if (s === 'ok') r.push(['✍️ Post', '🗓 Schedule a post'], ['👥 Audience', '📊 Insights'], ['📋 Manage scheduled']);
     r.push(['💳 Plan', '📩 Inbox'], ['👤 Profile', '⚙️ Account']);
@@ -173,7 +179,8 @@ const MENUS = {
   audience: { t: '👥 Audience', rows: () => [['👤 Contacts', '🏷 Lists'], ['🚫 Exclusions', '👪 Groups & links'], ['📣 Reach out']] },
   contacts: { t: '👤 Contacts', rows: () => [['📈 Summary', '👁 Who views me'], ['👁 Post viewers', '😴 Inactive 6m'], ['📤 Export numbers', '🧹 Fix duplicates']] },
   lists: { t: '🏷 Lists', rows: () => [['➕ New list', '➕ Add numbers'], ['📖 View lists', '🗑 Delete list']] },
-  messages: { t: '✉️ Messages', rows: () => [['✉️ New message', '📋 Scheduled messages'], ['📺 My channels']] },
+  messages: { t: '✉️ Messages', rows: () => [['✉️ New message', '📋 Scheduled messages'], ['📚 Group lists', '📺 My channels']] },
+  grouplists: { t: '📚 Group lists', rows: () => [['➕ New group list', '➕ Add groups to a list'], ['➖ Remove from a list', '📖 View group lists'], ['🗑 Delete group list']] },
   reach: { t: '📣 Reach out', rows: () => [['🔛 Reach-out on/off', '📊 Reach-out stats'], ['✏️ Reach-out messages', '🔢 Reach-out per day']] },
   excl: { t: '🚫 Exclusions', rows: () => [['➕ Exclude number', '➖ Un-exclude'], ['📖 View excluded']] },
   groups: { t: '👪 Groups & links', rows: () => [['📖 My groups', '😴 Quiet groups'], ['🔄 Refresh groups', '🔗 Group links'], ['🧹 Clean dead links', '🧾 Review dead links'], ['🏷 Tag settings']] },
@@ -227,7 +234,7 @@ const FONTS = { Default: 0, Text: 1, Script: 2, Bold: 6, Morning: 7, Calistoga: 
 const DAYN = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 const A = {}, F = {};                       // A: button actions, F: step handlers
-for (const [label, id] of [['📲 Link WhatsApp', 'link'], ['✍️ Post', 'post'], ['📄 Templates', 'templates'], ['🎨 My colours', 'colours'], ['📋 Manage scheduled', 'schedule'], ['👥 Audience', 'audience'], ['👤 Contacts', 'contacts'], ['🏷 Lists', 'lists'], ['🚫 Exclusions', 'excl'], ['👪 Groups & links', 'groups'], ['🏷 Tag settings', 'tagset'], ['📊 Insights', 'insights'], ['💳 Plan', 'plan'], ['📩 Inbox', 'inbox'], ['⚙️ Account', 'account'], ['🛠 Admin', 'admin'], ['👤 Users', 'adminUsers'], ['📢 Messages', 'adminMsg'], ['💰 Payments', 'adminPay'], ['⚙️ Settings', 'settings'], ['👮 Admins', 'admins'], ['🗂 Manage plans', 'adminPlans'], ['🧩 Features', 'features'], ['📣 Reach out', 'reach'], ['✉️ Messages', 'messages']]) A[label] = ctx => go(ctx, id);
+for (const [label, id] of [['📲 Link WhatsApp', 'link'], ['✍️ Post', 'post'], ['📄 Templates', 'templates'], ['🎨 My colours', 'colours'], ['📋 Manage scheduled', 'schedule'], ['👥 Audience', 'audience'], ['👤 Contacts', 'contacts'], ['🏷 Lists', 'lists'], ['🚫 Exclusions', 'excl'], ['👪 Groups & links', 'groups'], ['🏷 Tag settings', 'tagset'], ['📊 Insights', 'insights'], ['💳 Plan', 'plan'], ['📩 Inbox', 'inbox'], ['⚙️ Account', 'account'], ['🛠 Admin', 'admin'], ['👤 Users', 'adminUsers'], ['📢 Messages', 'adminMsg'], ['💰 Payments', 'adminPay'], ['⚙️ Settings', 'settings'], ['👮 Admins', 'admins'], ['🗂 Manage plans', 'adminPlans'], ['🧩 Features', 'features'], ['📣 Reach out', 'reach'], ['✉️ Messages', 'messages'], ['📚 Group lists', 'grouplists']]) A[label] = ctx => go(ctx, id);
 async function openScheduledComposer(ctx) {
   const s = St(ctx.from.id);
   await go(ctx, 'post');
@@ -1511,7 +1518,7 @@ F.mtype = (ctx, t, s) => {
   return ask(ctx, s, 'mmedia', `Send the ${k === 'file' ? 'file (PDF, document…)' : k}. You can add a caption, and {name} works there too.`);
 };
 F.mtext = (ctx, t, s) => { s.msg = { type: 'text', text: t.slice(0, 4000) }; return askMsgTarget(ctx, s); };
-const askMsgTarget = (ctx, s) => ask(ctx, s, 'mtarget', 'Who should receive it?', [['📱 Number(s)', '📋 A saved list'], ['👪 WhatsApp groups', '📺 Channel']]);
+const askMsgTarget = (ctx, s) => ask(ctx, s, 'mtarget', 'Who should receive it?', [['📱 Number(s)', '📋 A saved list'], ['👪 WhatsApp groups', '📚 A group list'], ['📺 Channel']]);
 const gname = g => g.subject || '(no name)';
 F.mtarget = (ctx, t, s) => {
   const u = ctx.from.id;
@@ -1522,6 +1529,7 @@ F.mtarget = (ctx, t, s) => {
     s.msel = []; s.gview = [];
     return ask(ctx, s, 'mgroups', 'Send a word from a group name to search, or choose 🔍 Show first 40. Then send the numbers you want, like 1 3 5 or 2-6.', [['🔍 Show first 40', '👑 Add all I admin'], ['✅ Done selecting', '🗑 Clear']]);
   }
+  if (t === '📚 A group list') { const L = Object.keys(load(u, 'grouplists', {})); return L.length ? ask(ctx, s, 'mgl', 'Choose the group list.', chunk(L, 2)) : out(ctx, 'You have no group lists yet. Create one under ✉️ Messages → 📚 Group lists.'); }
   if (t === '📺 Channel') {
     const H = load(u, 'channels', {}), ids = Object.keys(H); if (!ids.length) return out(ctx, 'No channels saved yet. Add one under ✉️ Messages → 📺 My channels.');
     s.gview = ids; return ask(ctx, s, 'mchan', `Which channel? Send the number (or several, like 1 2).\n\n${ids.map((id, n) => `${n + 1}. ${esc(H[id].name)} (${esc(H[id].role || '?')})`).join('\n')}`);
@@ -1535,10 +1543,10 @@ F.mnums = (ctx, t, s) => {
 };
 F.mlist = (ctx, t, s) => { if (!load(ctx.from.id, 'lists', {})[t]) return out(ctx, 'Choose a list from the buttons.'); s.msg.target = { kind: 'list', name: t }; return askMsgWhen(ctx, s); };
 F.mchan = (ctx, t, s) => { const idx = parseIdx(t, s.gview?.length || 0); if (!idx?.length) return out(ctx, 'Send a number from the list.'); s.msg.target = { kind: 'channels', ids: idx.map(n => s.gview[n - 1]) }; return askMsgWhen(ctx, s); };
-F.mgroups = (ctx, t, s) => {
+function pickGroups(ctx, t, s, done) {                              // shared by "message groups" and "group lists"
   const G = load(ctx.from.id, 'groups', {}), all = Object.entries(G).sort((a, b) => gname(a[1]).localeCompare(gname(b[1])));
   s.msel ||= []; s.gview ||= [];
-  if (t === '✅ Done selecting') { if (!s.msel.length) return out(ctx, 'Select at least one group first.'); s.msg.target = { kind: 'groups', ids: [...s.msel] }; return askMsgWhen(ctx, s); }
+  if (t === '✅ Done selecting') { if (!s.msel.length) return out(ctx, 'Select at least one group first.'); return done([...s.msel]); }
   if (t === '🗑 Clear') { s.msel = []; return out(ctx, 'Selection cleared.'); }
   if (t === '👑 Add all I admin') { for (const [id, g] of all) if (g.role === 'admin' && !s.msel.includes(id)) s.msel.push(id); return out(ctx, `✅ ${s.msel.length} group${s.msel.length === 1 ? '' : 's'} selected.`); }
   if (/^[\d\s,\-]+$/.test(t) && s.gview.length) {
@@ -1550,8 +1558,50 @@ F.mgroups = (ctx, t, s) => {
   if (!view.length) return out(ctx, 'No group matches that. Try another word.');
   s.gview = view.map(([id]) => id);
   return out(ctx, `${view.map(([id, g], n) => `${n + 1}. ${esc(gname(g))} (${g.size || 0})${g.role === 'admin' ? ' 👑' : ''}${s.msel.includes(id) ? ' ✅' : ''}`).join('\n')}\n\nSend the numbers to add. Selected so far: ${s.msel.length}.`);
+}
+F.mgroups = (ctx, t, s) => pickGroups(ctx, t, s, ids => { s.msg.target = { kind: 'groups', ids }; return askMsgWhen(ctx, s); });
+F.mgl = (ctx, t, s) => { if (!load(ctx.from.id, 'grouplists', {})[t]) return out(ctx, 'Choose a list from the buttons.'); s.msg.target = { kind: 'grouplist', name: t }; return askMsgWhen(ctx, s); };
+
+// ---------- saved lists of WhatsApp groups ----------
+const GL_HELP = 'Send a word from a group name to search, or choose 🔍 Show first 40. Then send the numbers you want, like 1 3 5 or 2-6.';
+const GL_ROWS = [['🔍 Show first 40', '👑 Add all I admin'], ['✅ Done selecting', '🗑 Clear']];
+const glNames = u => Object.keys(load(u, 'grouplists', {}));
+F.glpick = (ctx, t, s) => pickGroups(ctx, t, s, ids => {
+  const u = ctx.from.id, GL = load(u, 'grouplists', {}), name = s.glname;
+  GL[name] = [...new Set([...(GL[name] || []), ...ids])]; save(u, 'grouplists', GL); reset(s);
+  return out(ctx, `✅ “${esc(name)}” now has ${GL[name].length} group${GL[name].length === 1 ? '' : 's'}.`);
+});
+A['➕ New group list'] = ctx => {
+  if (!Object.keys(load(ctx.from.id, 'groups', {})).length) return out(ctx, 'No groups are synced yet. Please try again in a few minutes.');
+  return ask(ctx, St(ctx.from.id), 'glnew', 'Name the group list, for example Church groups or Customers.');
 };
-const targetText = t => ({ numbers: `${(t.numbers || []).length} number(s)`, list: `list “${t.name}”`, groups: `${(t.ids || []).length} group(s)`, channels: `${(t.ids || []).length} channel(s)` })[t?.kind] || '?';
+F.glnew = (ctx, t, s) => {
+  const u = ctx.from.id, name = t.trim().slice(0, 30); if (!name) return out(ctx, 'Send a name for the list.');
+  const GL = load(u, 'grouplists', {}); GL[name] ??= []; save(u, 'grouplists', GL); s.glname = name; s.msel = []; s.gview = [];
+  return ask(ctx, s, 'glpick', `📚 “${esc(name)}” is ready. ${GL_HELP}`, GL_ROWS);
+};
+A['➕ Add groups to a list'] = ctx => glNames(ctx.from.id).length ? ask(ctx, St(ctx.from.id), 'gladd', 'Which list?', chunk(glNames(ctx.from.id), 2)) : out(ctx, 'No group lists yet. Create one first.');
+F.gladd = (ctx, t, s) => { if (!load(ctx.from.id, 'grouplists', {})[t]) return out(ctx, 'Choose a list from the buttons.'); s.glname = t; s.msel = []; s.gview = []; return ask(ctx, s, 'glpick', GL_HELP, GL_ROWS); };
+A['📖 View group lists'] = ctx => {
+  const u = ctx.from.id, GL = load(u, 'grouplists', {}), G = load(u, 'groups', {}), names = Object.keys(GL);
+  if (!names.length) return out(ctx, 'No group lists yet.');
+  return sendBatches(ctx, `📚 <b>${names.length} group list${names.length === 1 ? '' : 's'}</b>`, names.map(n => { const live = GL[n].filter(id => G[id]); return `<b>${esc(n)}</b> (${live.length})\n${live.slice(0, 12).map(id => esc(gname(G[id]))).join(', ')}${live.length > 12 ? ` … +${live.length - 12} more` : ''}\n`; }));
+};
+A['➖ Remove from a list'] = ctx => glNames(ctx.from.id).length ? ask(ctx, St(ctx.from.id), 'glrmList', 'Which list?', chunk(glNames(ctx.from.id), 2)) : out(ctx, 'No group lists yet.');
+F.glrmList = (ctx, t, s) => {
+  const u = ctx.from.id, GL = load(u, 'grouplists', {}), G = load(u, 'groups', {}); if (!GL[t]) return out(ctx, 'Choose a list from the buttons.');
+  s.glname = t; s.gview = GL[t].filter(id => G[id]); if (!s.gview.length) { reset(s); return out(ctx, 'That list has no groups.'); }
+  out(ctx, s.gview.map((id, n) => `${n + 1}. ${esc(gname(G[id]))}`).join('\n').slice(0, 3800));
+  return ask(ctx, s, 'glrm', 'Send the numbers to remove (like 1 3 or 2-6).');
+};
+F.glrm = (ctx, t, s) => {
+  const u = ctx.from.id, idx = parseIdx(t, s.gview?.length || 0); if (!idx?.length) return out(ctx, 'Send numbers like 1 3, or a range like 2-6.');
+  const GL = load(u, 'grouplists', {}), drop = new Set(idx.map(n => s.gview[n - 1])); GL[s.glname] = (GL[s.glname] || []).filter(id => !drop.has(id)); save(u, 'grouplists', GL); reset(s);
+  return out(ctx, `✅ Removed ${drop.size}. “${esc(s.glname)}” has ${GL[s.glname].length} left.`);
+};
+A['🗑 Delete group list'] = ctx => glNames(ctx.from.id).length ? ask(ctx, St(ctx.from.id), 'gldel', 'Delete which list?', chunk(glNames(ctx.from.id), 2)) : out(ctx, 'No group lists yet.');
+F.gldel = (ctx, t, s) => { const u = ctx.from.id, GL = load(u, 'grouplists', {}); if (!GL[t]) return out(ctx, 'Choose a list from the buttons.'); delete GL[t]; save(u, 'grouplists', GL); reset(s); return out(ctx, `🗑 “${esc(t)}” deleted.`); };
+const targetText = t => ({ grouplist: `group list “${t?.name}”`, numbers: `${(t.numbers || []).length} number(s)`, list: `list “${t.name}”`, groups: `${(t.ids || []).length} group(s)`, channels: `${(t.ids || []).length} channel(s)` })[t?.kind] || '?';
 function askMsgWhen(ctx, s) {
   const u = ctx.from.id, n = W.targetCount(u, s.msg.target), x = W.msgUsage(u);
   return ask(ctx, s, 'mwhen', `✉️ ${esc((s.msg.type === 'text' ? s.msg.text : s.msg.caption || s.msg.type).replace(/\s+/g, ' ').slice(0, 60))}\n→ ${esc(targetText(s.msg.target))} (${n} will receive it)\nToday: ${x.n} of ${x.cap} messages used.\n\nWhen should it go?`, [['🚀 Send now', '🗓 Schedule']]);
@@ -1749,6 +1799,7 @@ async function clearBotMenu() {                                   // no slash co
 }
 function main() {
   W.lockOrExit();
+  if (process.env.MINIAPP_ORIGIN) startApi({ port: Number(process.env.MINIAPP_PORT || 3000), origins: process.env.MINIAPP_ORIGIN.split(',').map(x => x.trim().replace(/\/$/, '')).filter(Boolean), token: CFG.token, W, canSee, isAdm, build: BUILD });
   // Telegraf's launch promise remains pending for as long as polling runs.
   // Use its onLaunch callback for startup work instead of awaiting that promise.
   bot.launch({ allowedUpdates: ['message', 'edited_message', 'callback_query', 'my_chat_member', 'poll', 'poll_answer', 'message_reaction'] }, () => {
