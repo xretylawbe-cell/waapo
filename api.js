@@ -34,6 +34,30 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
   const need = (uid, label) => { if (!canSee(uid, label)) throw E(403, 'That part is not switched on for your account.'); };
   const targetInfo = t => ({ kind: t?.kind, count: t?.kind === 'numbers' ? (t.numbers || []).length : (t?.ids || []).length, name: t?.name });
 
+  const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
+  const futureAt = v => { const at = Number(v); if (!(at > Date.now() + 30000)) throw E(400, 'Pick a time in the future.'); if (at > Date.now() + 90 * 864e5) throw E(400, 'Pick a time within 90 days.'); return at; };
+  const cleanTarget = (uid, t = {}) => {                              // never trust the target the page sends
+    if (t.kind === 'numbers') {
+      const raw = Array.isArray(t.numbers) ? t.numbers : String(t.numbers || '').split(/[\s,;]+/);
+      const numbers = [...new Set(raw.map(x => String(x).replace(/\D/g, '')).filter(x => x.length >= 7 && x.length <= 15))];
+      if (!numbers.length) throw E(400, 'Add at least one valid number with country code.'); return { kind: 'numbers', numbers };
+    }
+    if (t.kind === 'list') { if (!has(W.load(uid, 'lists', {}), t.name)) throw E(400, 'That list does not exist.'); return { kind: 'list', name: String(t.name) }; }
+    if (t.kind === 'grouplist') { if (!has(W.load(uid, 'grouplists', {}), t.name)) throw E(400, 'That group list does not exist.'); return { kind: 'grouplist', name: String(t.name) }; }
+    if (t.kind === 'groups' || t.kind === 'channels') {
+      const store = W.load(uid, t.kind === 'groups' ? 'groups' : 'channels', {}), ids = [...new Set((Array.isArray(t.ids) ? t.ids : []).map(String).filter(id => has(store, id)))];
+      if (!ids.length) throw E(400, t.kind === 'groups' ? 'Pick at least one group.' : 'Pick at least one channel.'); return { kind: t.kind, ids };
+    }
+    throw E(400, 'Choose who should receive it.');
+  };
+  const applyEdit = (uid, item, body, maxText) => {                  // change the wording and/or the time of a scheduled item
+    if (body.text !== undefined) {
+      const text = String(body.text).trim(); if (item.type === 'text' && !text) throw E(400, 'The text cannot be empty.'); if (text.length > maxText) throw E(400, `Keep it under ${maxText} characters.`);
+      const probe = item.type === 'text' ? { ...item, text } : { ...item, caption: text }, sg = W.checkSpam(uid, probe); if (!sg.ok) throw E(400, `This ${item.type === 'text' ? 'text' : 'caption'} ${sg.reason}.`);
+      if (item.type === 'text') item.text = text; else item.caption = text;
+    }
+    if (body.at !== undefined) { item.at = futureAt(body.at); delete item.retryAt; delete item.notifiedDown; delete item.lastErr; }
+  };
   const routes = {
     'GET /api/me': uid => {
       const p = W.prof(uid), C = Object.values(W.load(uid, 'contacts', {})), me = W.waMe(uid), now = Date.now();
@@ -47,7 +71,7 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
           scheduledPosts: W.load(uid, 'posts', []).filter(x => x.status === 'scheduled').length, scheduledMessages: W.load(uid, 'msgs', []).filter(x => x.status === 'scheduled').length,
           lists: Object.keys(W.load(uid, 'lists', {})).length + Object.keys(W.load(uid, 'grouplists', {})).length
         },
-        features: { post: canSee(uid, '✍️ Post'), schedule: canSee(uid, '🗓 Schedule a post'), messages: canSee(uid, '✉️ Messages'), sending: canSee(uid, '📡 Sending now'), lists: canSee(uid, '🏷 Lists') }
+        features: { post: canSee(uid, '✍️ Post'), schedule: canSee(uid, '🗓 Schedule a post'), messages: canSee(uid, '✉️ Messages'), sending: canSee(uid, '📡 Sending now'), lists: canSee(uid, '🏷 Lists'), plan: canSee(uid, '💳 Plan'), insights: canSee(uid, '📊 Insights') }
       };
     },
     'GET /api/posts': uid => {
@@ -86,6 +110,69 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
       const M = W.load(uid, 'msgs', []), m = M.find(x => String(x.id) === id && x.status === 'scheduled'); if (!m) throw E(404, 'That message is no longer scheduled.');
       m.status = 'cancelled'; W.save(uid, 'msgs', M); W.logActivity(uid, 'app-cancel-message', id); return { ok: true };
     },
+    'GET /api/groups': (uid, _p, _b, q) => {
+      need(uid, '✉️ Messages');
+      const term = String(q.get('q') || '').trim().toLowerCase().slice(0, 40), G = W.load(uid, 'groups', {});
+      const groups = Object.entries(G).filter(([, g]) => !term || String(g.subject || '').toLowerCase().includes(term)).sort((a, b) => String(a[1].subject || '').localeCompare(String(b[1].subject || ''))).slice(0, 40)
+        .map(([id, g]) => ({ id, name: g.subject || '(no name)', size: g.size || 0, admin: g.role === 'admin' }));
+      return { groups, total: Object.keys(G).length };
+    },
+    'GET /api/channels': uid => { need(uid, '✉️ Messages'); const H = W.load(uid, 'channels', {}); return { channels: Object.entries(H).map(([id, c]) => ({ id, name: c.name, role: c.role || '' })) }; },
+    'POST /api/messages': async (uid, _p, body) => {
+      need(uid, '✉️ Messages');
+      if (!W.linked(uid)) throw E(400, 'Link WhatsApp in the bot first.');
+      const text = String(body.text ?? '').trim(); if (!text) throw E(400, 'Write the message first.'); if (text.length > 2000) throw E(400, 'Keep it under 2000 characters.');
+      const target = cleanTarget(uid, body.target), n = W.targetCount(uid, target); if (!n) throw E(400, 'Nobody to send this to. Check who you picked.');
+      const { max } = W.msgUsage(uid); if (!isAdm(uid) && n > max) throw E(400, `Too many recipients (${n}). The limit is ${max} per message.`);
+      const m = { type: 'text', text, target, id: Date.now() }, sg = W.checkSpam(uid, m); if (!sg.ok) throw E(400, `This message ${sg.reason}.`);
+      if (body.when === 'later') {
+        const at = futureAt(body.at), M = W.load(uid, 'msgs', []); M.push({ ...m, at, repeat: 'none', status: 'scheduled' }); W.save(uid, 'msgs', M); W.logActivity(uid, 'app-schedule-message', m.id);
+        return { scheduled: true, at, recipients: n };
+      }
+      if (!W.isUp(uid)) throw E(400, 'WhatsApp is not connected right now.');
+      const run = W.runMessage(uid, m); W.logActivity(uid, 'app-send-message', m.id);
+      const early = await Promise.race([run.then(() => null, e => e), sleep(800)]);
+      if (early instanceof Error) throw E(400, early.message);
+      run.catch(() => {}); return { started: true, recipients: n };
+    },
+    'POST /api/posts/:id/edit': (uid, { id }, body) => {
+      need(uid, '🗓 Schedule a post');
+      const P = W.load(uid, 'posts', []), p = P.find(x => String(x.id) === id && x.status === 'scheduled'); if (!p) throw E(404, 'That post is no longer scheduled.');
+      applyEdit(uid, p, body, 700); W.save(uid, 'posts', P); W.logActivity(uid, 'app-edit-post', id); return { ok: true, at: p.at };
+    },
+    'POST /api/messages/:id/edit': (uid, { id }, body) => {
+      need(uid, '✉️ Messages');
+      const M = W.load(uid, 'msgs', []), m = M.find(x => String(x.id) === id && x.status === 'scheduled'); if (!m) throw E(404, 'That message is no longer scheduled.');
+      applyEdit(uid, m, body, 2000); W.save(uid, 'msgs', M); W.logActivity(uid, 'app-edit-message', id); return { ok: true, at: m.at };
+    },
+    'GET /api/plans': uid => {
+      need(uid, '💳 Plan');
+      const pf = W.prof(uid), online = W.onlinePayOn(), general = { link: W.CFG.payLink || '', bank: W.CFG.bank || '' };
+      return { online, email: pf.email || '', general, plans: W.load('_g', 'plans', []).map(p => ({ id: p.id, name: p.name, price: p.price, days: p.days, payable: online && !!W.parsePrice(p.price), manual: { link: p.link || general.link, bank: p.bank || general.bank } })) };
+    },
+    'POST /api/pay': async (uid, _p, body) => {
+      need(uid, '💳 Plan');
+      if (!W.onlinePayOn()) throw E(400, 'Online payment is not switched on. Use the bank details instead.');
+      const plan = W.load('_g', 'plans', []).find(x => String(x.id) === String(body.planId)); if (!plan) throw E(404, 'That plan no longer exists.');
+      const pf = W.prof(uid); let email = String(body.email || pf.email || '').trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || email.length > 120) throw E(400, 'Enter a valid email address for the receipt.');
+      if (email !== pf.email) { pf.email = email; W.save(uid, 'profile', pf); }
+      pf.pendingPlan = plan.id; W.save(uid, 'profile', pf);
+      try { const r = await W.startOnlinePayment(uid, plan, email); W.logActivity(uid, 'app-pay-start', r.ref, plan.name); return { url: r.url }; }
+      catch (e) { throw E(400, e.message || 'Could not start the payment.'); }
+    },
+    'GET /api/insights': uid => {
+      need(uid, '📊 Insights');
+      const V = W.load(uid, 'views', { log: [] }), C = W.load(uid, 'contacts', {}), H = W.load(uid, 'history', []), hours = Array(24).fill(0);
+      for (const x of V.log || []) if (x.h >= 0 && x.h < 24) hours[x.h]++;
+      const since = Date.now() - 7 * 864e5, last7 = (V.log || []).filter(x => x.t >= since), vs = Object.entries(C).filter(([, c]) => c.v > 0);
+      return {
+        hours, views7: last7.length, viewers7: new Set(last7.map(x => x.who)).size, posts7: H.filter(h => h.at >= since).length,
+        totals: { posts: H.length, viewers: vs.length, views: vs.reduce((s, [, c]) => s + c.v, 0) },
+        topViewers: vs.sort((a, b) => b[1].v - a[1].v).slice(0, 10).map(([n, c]) => ({ name: c.name || '', number: n, views: c.v, last: c.lastView || 0 })),
+        bestPosts: [...H].sort((a, b) => (b.viewers?.length || 0) - (a.viewers?.length || 0)).slice(0, 5).map(h => ({ preview: h.preview, at: h.at, views: h.viewers?.length || 0, sent: Math.max(0, (h.n || 1) - 1) }))
+      };
+    },
     'GET /api/jobs': uid => { need(uid, '📡 Sending now'); return { jobs: W.activeJobs(uid).map(j => ({ id: j.id, type: j.type, preview: j.preview, total: j.total, sent: j.sent, started: j.started, stopping: !!j.cancel })) }; },
     'POST /api/jobs/:id/stop': (uid, { id }) => { need(uid, '📡 Sending now'); const n = W.cancelJobs(uid, id); if (!n) throw E(404, 'That send already finished.'); W.logActivity(uid, 'app-stop-send', id); return { ok: true }; },
     'GET /api/lists': uid => {
@@ -115,7 +202,7 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
       for (const r of compiled) {
         if (r.method !== req.method) continue; const hit = r.re.exec(path); if (!hit) continue;
         const body = req.method === 'POST' ? await readBody(req) : {};
-        return send(res, 200, await r.fn(uid, hit.groups || {}, body), cors);
+        return send(res, 200, await r.fn(uid, hit.groups || {}, body, new URL(req.url, 'http://x').searchParams), cors);
       }
       return send(res, 404, { error: 'Not found.' }, cors);
     } catch (e) {
