@@ -1789,7 +1789,7 @@ async function resumeLinkedSessions() {                            // one sessio
   for (const uid of users()) {
     if (!W.linked(uid)) continue;
     W.connect(uid, 'resume').catch(e => console.error(`WhatsApp resume failed for ${uid}:`, e?.message || e));
-    await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+    await new Promise(r => setTimeout(r, 150 + Math.random() * 300));
   }
 }
 
@@ -1803,6 +1803,11 @@ async function clearBotMenu() {                                   // no slash co
 }
 function main() {
   W.lockOrExit();
+  resumeLinkedSessions();                                          // do NOT wait for Telegram: WhatsApp sessions come up immediately on start
+  if (process.env.PROXY_URL) {                                     // Render's free tier sleeps after ~15 min idle: ping it so the Mini App never hits a cold start
+    const ping = () => fetch(process.env.PROXY_URL.replace(/\/$/, '') + '/healthz', { signal: AbortSignal.timeout(20000) }).catch(() => {});
+    ping(); setInterval(ping, 9 * 60e3).unref();
+  }
   if (process.env.MINIAPP_ORIGIN) startApi({ port: Number(process.env.MINIAPP_PORT || 3000), origins: process.env.MINIAPP_ORIGIN.split(',').map(x => x.trim().replace(/\/$/, '')).filter(Boolean), token: CFG.token, W, canSee, isAdm, build: BUILD });
   // Telegraf's launch promise remains pending for as long as polling runs.
   // Use its onLaunch callback for startup work instead of awaiting that promise.
@@ -1812,7 +1817,6 @@ function main() {
     console.log('Bot running — build', BUILD);
     if (CFG.admin) tg.sendMessage(CFG.admin, `✅ Bot started.\nBuild: ${BUILD}`).catch(() => {});
     tg.getMe().then(me => { botUser = me.username || ''; }).catch(() => {});
-    resumeLinkedSessions();
     W.startScheduler();
   }).catch(async err => {
     console.error('Telegram bot failed to start:', err?.message || err);

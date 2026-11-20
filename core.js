@@ -25,7 +25,7 @@ export const isAdmin = u => adminList().includes(String(u));
 export const isOwner = u => String(u) === BASE.admin;
 export const setAdmins = a => save('_g', 'admins', a);
 const TZ = BASE.tz, DAY = 864e5;
-export const DATA = 'data';
+export const DATA = process.env.DATA_DIR || 'data';   // point DATA_DIR at a PERSISTENT disk/volume or sessions are lost on every redeploy
 fs.mkdirSync(`${DATA}/deleted`, { recursive: true });
 export const sleep = ms => new Promise(r => {
   const timer = setTimeout(r, ms);
@@ -74,7 +74,30 @@ const argb = h => parseInt('FF' + h.replace('#', ''), 16);
 const socks = {}, gen = {}, tries = {}, up = {}, alerted = {}, repairs = {}, sentMsgs = new Map(), pendingCode = {}, lastCodeReq = {}, loggedOutOnce = {}, stableT = {};
 export const isUp = u => !!up[u];
 const isPairedCreds = c => !!(c?.me && (c.account || (Array.isArray(c.signalIdentities) && c.signalIdentities.length)));   // set by pair-success only
-export const linked = u => { try { return isPairedCreds(JSON.parse(fs.readFileSync(`${DATA}/${u}/auth/creds.json`))); } catch { return false; } };
+export const linked = u => { for (const n of ['creds.json', 'creds.bak']) { try { if (isPairedCreds(JSON.parse(fs.readFileSync(`${DATA}/${u}/auth/${n}`)))) return true; } catch {} } return false; };   // creds.bak = safety copy, survives a half-written creds.json
+
+// A crash or kill during a write can leave creds.json empty/corrupt, which looks like "logged out". Keep a verified copy and restore it.
+function restoreCreds(uid) {
+  const d = `${DATA}/${uid}/auth`, f = `${d}/creds.json`, b = `${d}/creds.bak`;
+  try { JSON.parse(fs.readFileSync(f, 'utf8')); return; } catch {}
+  try { JSON.parse(fs.readFileSync(b, 'utf8')); fs.copyFileSync(b, f); logHealth(uid, 'restored', 'creds from backup'); } catch {}
+}
+function backupCreds(uid) {
+  const d = `${DATA}/${uid}/auth`;
+  try { const t = fs.readFileSync(`${d}/creds.json`, 'utf8'); JSON.parse(t); fs.writeFileSync(`${d}/creds.bak.tmp`, t); fs.renameSync(`${d}/creds.bak.tmp`, `${d}/creds.bak`); } catch {}
+}
+
+// Fetching the latest WhatsApp Web version on EVERY connect added a network round-trip (sometimes many seconds) before each link/reconnect. Cache it, cap the wait, fall back to Baileys' built-in version.
+let waVer = null, waVerAt = 0;
+async function waVersion() {
+  if (waVer && Date.now() - waVerAt < 6 * 36e5) return waVer;
+  try {
+    const r = await Promise.race([fetchLatestBaileysVersion(), sleep(3000).then(() => null)]);
+    if (r?.version && !r.error) { waVer = r.version; waVerAt = Date.now(); }
+  } catch {}
+  return waVer;
+}
+waVersion();                                                      // warm the cache at startup
 const wipe = u => { fs.rmSync(`${DATA}/${u}/auth`, { recursive: true, force: true }); try { const p = prof(u); p.welcomed = false; save(u, 'profile', p); } catch {} };
 
 const badBuf = {}, lastAuto = {}, closes = {};
@@ -148,15 +171,17 @@ export async function connect(uid, mode = 'resume', phone = '') {
   }
   const my = gen[uid] = (gen[uid] || 0) + 1;
   try { socks[uid]?.end?.(undefined); } catch {}
-  const { state, saveCreds } = await useMultiFileAuthState(`${udir(uid)}/auth`);
-  const { version } = await fetchLatestBaileysVersion();
+  restoreCreds(uid);
+  const { state, saveCreds: rawSave } = await useMultiFileAuthState(`${udir(uid)}/auth`);
+  const saveCreds = async () => { await rawSave(); backupCreds(uid); };
+  const version = await waVersion();
   if (gen[uid] !== my) return;                                  // a newer connect() took over: never run two sockets on one session
   const log = makeLogger(uid);
   const sock = makeWASocket({
-    version, auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, log) }, logger: log,
+    ...(version ? { version } : {}), auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, log) }, logger: log,
     getMessage: async k => sentMsgs.get(k.id), browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false, markOnlineOnConnect: false, syncFullHistory: false,
-    qrTimeout: 120000, keepAliveIntervalMs: 25000, connectTimeoutMs: 90000, defaultQueryTimeoutMs: 120000
+    qrTimeout: 120000, keepAliveIntervalMs: 20000, connectTimeoutMs: 30000, defaultQueryTimeoutMs: 60000, retryRequestDelayMs: 250
   });
   socks[uid] = sock;
   let codeAsked = false;
@@ -217,7 +242,7 @@ export async function connect(uid, mode = 'resume', phone = '') {
       if (code === 440) { delete socks[uid]; return hooks.note(uid, '⚠️ Another session replaced this one. Re-link if needed.', true); }
       tries[uid] = (tries[uid] || 0) + 1;                          // 428/408/503 etc: back off, then keep trying quietly
       if (tries[uid] === 4 && prof(uid).alerts && !alerted[uid]) { alerted[uid] = true; hooks.note(uid, '🔴 WhatsApp is disconnected. I keep retrying; tell me if it persists.', true); }
-      await sleep(Math.min(60000, 1500 * tries[uid]) + Math.random() * 1500);        // jitter: thousands of sessions must never retry in lockstep
+      await sleep(tries[uid] === 1 ? 250 + Math.random() * 400 : Math.min(60000, 1500 * tries[uid]) + Math.random() * 1500);   // first retry almost instant        // jitter: thousands of sessions must never retry in lockstep
       if (gen[uid] === my) connect(uid, 'resume').catch(() => {});
     }
   });
