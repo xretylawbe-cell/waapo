@@ -40,7 +40,11 @@ const kb = rows => {
 };
 const normalizeButton = text => text;
 const keyboardFor = u => kb(St(u).keyboardRows || MENUS.home.rows(u));
-const nums = t => [...new Set(t.split(/[\s,;]+/).map(x => x.replace(/\D/g, '')).filter(x => x.length >= 7 && x.length <= 15))];
+const nums = t => {                                                  // "+234 801 111 1111" is one number; two numbers on one line are split
+  const good = []; const take = s => { const d = s.replace(/\D/g, ''); if (d.length >= 7 && d.length <= 15) { good.push(d); return true; } return false; };
+  for (const tok of String(t).split(/[\n,;]+/).map(x => x.trim()).filter(Boolean)) { if (take(tok)) continue; const parts = tok.split(/\s+/); if (parts.length > 1) parts.forEach(take); }
+  return [...new Set(good)];
+};
 const tg = bot.telegram;
 const hasFileAttachment = m => !!(m?.document || m?.photo || m?.video || m?.audio || m?.voice || m?.video_note || m?.animation || m?.sticker);
 

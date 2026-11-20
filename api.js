@@ -24,9 +24,9 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
   setInterval(() => { const t = Date.now(); for (const [k, w] of hits) if (!w.some(x => t - x < 60000)) hits.delete(k); }, 120000).unref();
   const send = (res, code, body, cors) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...cors }); res.end(JSON.stringify(body)); };
   const readBody = req => new Promise((ok, bad) => {
-    let n = 0, b = '';
-    req.on('data', c => { n += c.length; if (n > 20000) { bad(Object.assign(new Error('That request is too large.'), { code: 413 })); req.destroy(); } else b += c; });
-    req.on('end', () => { try { ok(b ? JSON.parse(b) : {}); } catch { bad(Object.assign(new Error('Invalid request.'), { code: 400 })); } });
+    let n = 0, b = '', big = false;
+    req.on('data', c => { n += c.length; if (n > 1e6) req.destroy(); else if (n > 20000) { big = true; b = ''; } else if (!big) b += c; });   // read past the limit (up to 1 MB) so we can answer politely
+    req.on('end', () => { if (big) return bad(Object.assign(new Error('That request is too large. Send fewer items at a time.'), { code: 413 })); try { ok(b ? JSON.parse(b) : {}); } catch { bad(Object.assign(new Error('Invalid request.'), { code: 400 })); } });
     req.on('error', bad);
   });
   const E = (code, message) => Object.assign(new Error(message), { code });
@@ -36,10 +36,15 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
 
   const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
   const futureAt = v => { const at = Number(v); if (!(at > Date.now() + 30000)) throw E(400, 'Pick a time in the future.'); if (at > Date.now() + 90 * 864e5) throw E(400, 'Pick a time within 90 days.'); return at; };
+  const parseNumbers = input => {                                   // "+234 801 111 1111" is ONE number; "2348011111111 2348022222222" on one line is two
+    const tokens = (Array.isArray(input) ? input.map(String) : String(input || '').split(/[\n,;]+/)).map(x => x.trim()).filter(Boolean), good = []; let bad = 0;
+    const take = s => { const d = s.replace(/\D/g, ''); if (d.length >= 7 && d.length <= 15) { good.push(d); return true; } return false; };
+    for (const t of tokens) { if (take(t)) continue; const parts = t.split(/\s+/).filter(Boolean); if (parts.length > 1) { for (const p of parts) if (!take(p)) bad++; } else bad++; }
+    return { items: [...new Set(good)], skipped: bad };
+  };
   const cleanTarget = (uid, t = {}) => {                              // never trust the target the page sends
     if (t.kind === 'numbers') {
-      const raw = Array.isArray(t.numbers) ? t.numbers : String(t.numbers || '').split(/[\s,;]+/);
-      const numbers = [...new Set(raw.map(x => String(x).replace(/\D/g, '')).filter(x => x.length >= 7 && x.length <= 15))];
+      const numbers = parseNumbers(t.numbers).items;
       if (!numbers.length) throw E(400, 'Add at least one valid number with country code.'); return { kind: 'numbers', numbers };
     }
     if (t.kind === 'list') { if (!has(W.load(uid, 'lists', {}), t.name)) throw E(400, 'That list does not exist.'); return { kind: 'list', name: String(t.name) }; }
@@ -58,6 +63,18 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
     }
     if (body.at !== undefined) { item.at = futureAt(body.at); delete item.retryAt; delete item.notifiedDown; delete item.lastErr; }
   };
+  const RESERVED = /^(__proto__|constructor|prototype|tostring|hasownproperty|valueof)$/i, CAP = { numbers: 5000, groups: 500 };
+  const kindOf = k => { if (k !== 'numbers' && k !== 'groups') throw E(400, 'Unknown list type.'); return k; };
+  const fileOf = kind => (kind === 'groups' ? 'grouplists' : 'lists');
+  const listNeed = (uid, kind) => need(uid, kind === 'groups' ? '📚 Group lists' : '🏷 Lists');
+  const listName = raw => { const n = String(raw ?? '').replace(/[\u0000-\u001f]/g, '').trim(); if (!n || n.length > 30) throw E(400, 'Give the list a name of 1 to 30 characters.'); if (RESERVED.test(n)) throw E(400, 'Please choose a different name.'); return n; };
+  const cleanItems = (uid, kind, items) => {                         // returns only valid entries, plus how many were rejected
+    if (kind === 'numbers') {
+      return parseNumbers(items);
+    }
+    const G = W.load(uid, 'groups', {}), raw = (Array.isArray(items) ? items : []).map(String), good = raw.filter(id => has(G, id)); return { items: [...new Set(good)], skipped: raw.length - good.length };
+  };
+  const getList = (uid, kind, rawName) => { const store = W.load(uid, fileOf(kind), {}), name = String(rawName ?? ''); if (!has(store, name)) throw E(404, 'That list no longer exists.'); return { store, name }; };
   const routes = {
     'GET /api/me': uid => {
       const p = W.prof(uid), C = Object.values(W.load(uid, 'contacts', {})), me = W.waMe(uid), now = Date.now();
@@ -71,7 +88,7 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
           scheduledPosts: W.load(uid, 'posts', []).filter(x => x.status === 'scheduled').length, scheduledMessages: W.load(uid, 'msgs', []).filter(x => x.status === 'scheduled').length,
           lists: Object.keys(W.load(uid, 'lists', {})).length + Object.keys(W.load(uid, 'grouplists', {})).length
         },
-        features: { post: canSee(uid, '✍️ Post'), schedule: canSee(uid, '🗓 Schedule a post'), messages: canSee(uid, '✉️ Messages'), sending: canSee(uid, '📡 Sending now'), lists: canSee(uid, '🏷 Lists'), plan: canSee(uid, '💳 Plan'), insights: canSee(uid, '📊 Insights') }
+        features: { post: canSee(uid, '✍️ Post'), schedule: canSee(uid, '🗓 Schedule a post'), messages: canSee(uid, '✉️ Messages'), sending: canSee(uid, '📡 Sending now'), lists: canSee(uid, '🏷 Lists'), glists: canSee(uid, '📚 Group lists'), plan: canSee(uid, '💳 Plan'), insights: canSee(uid, '📊 Insights') }
       };
     },
     'GET /api/posts': uid => {
@@ -109,6 +126,34 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
       need(uid, '✉️ Messages');
       const M = W.load(uid, 'msgs', []), m = M.find(x => String(x.id) === id && x.status === 'scheduled'); if (!m) throw E(404, 'That message is no longer scheduled.');
       m.status = 'cancelled'; W.save(uid, 'msgs', M); W.logActivity(uid, 'app-cancel-message', id); return { ok: true };
+    },
+    'GET /api/list': (uid, _p, _b, q) => {
+      const kind = kindOf(q.get('kind')); listNeed(uid, kind); const { store, name } = getList(uid, kind, q.get('name')), ids = store[name];
+      const used = W.load(uid, 'msgs', []).filter(m => m.status === 'scheduled' && m.target?.kind === (kind === 'groups' ? 'grouplist' : 'list') && m.target.name === name).length;
+      if (kind === 'numbers') { const C = W.load(uid, 'contacts', {}); return { kind, name, total: ids.length, used, members: ids.slice(0, 200).map(n => ({ number: n, name: C[n]?.name || '' })) }; }
+      const G = W.load(uid, 'groups', {});
+      return { kind, name, total: ids.length, used, members: ids.slice(0, 200).map(id => has(G, id) ? { id, name: G[id].subject || '(no name)', size: G[id].size || 0 } : { id, name: 'A group you have left', size: 0, gone: true }) };
+    },
+    'POST /api/lists': (uid, _p, b) => {
+      const kind = kindOf(b.kind); listNeed(uid, kind); const name = listName(b.name), store = W.load(uid, fileOf(kind), {});
+      if (has(store, name)) throw E(400, 'You already have a list with that name.'); if (Object.keys(store).length >= 50) throw E(400, 'You can keep up to 50 lists of each kind.');
+      const c = cleanItems(uid, kind, b.items); if (c.items.length > CAP[kind]) throw E(400, `A list can hold up to ${CAP[kind]}.`);
+      store[name] = c.items; W.save(uid, fileOf(kind), store); W.logActivity(uid, 'app-create-list', name, kind); return { ok: true, name, total: c.items.length, skipped: c.skipped };
+    },
+    'POST /api/lists/add': (uid, _p, b) => {
+      const kind = kindOf(b.kind); listNeed(uid, kind); const { store, name } = getList(uid, kind, b.name), c = cleanItems(uid, kind, b.items), before = new Set(store[name]);
+      const merged = [...new Set([...store[name], ...c.items])]; if (merged.length > CAP[kind]) throw E(400, `A list can hold up to ${CAP[kind]}.`);
+      store[name] = merged; W.save(uid, fileOf(kind), store); W.logActivity(uid, 'app-add-to-list', name, String(c.items.length));
+      return { ok: true, added: c.items.filter(x => !before.has(x)).length, skipped: c.skipped, total: merged.length };
+    },
+    'POST /api/lists/remove': (uid, _p, b) => {
+      const kind = kindOf(b.kind); listNeed(uid, kind); const { store, name } = getList(uid, kind, b.name), drop = new Set((Array.isArray(b.items) ? b.items : []).map(String)), before = store[name].length;
+      store[name] = store[name].filter(x => !drop.has(x)); W.save(uid, fileOf(kind), store); W.logActivity(uid, 'app-remove-from-list', name, String(before - store[name].length));
+      return { ok: true, removed: before - store[name].length, total: store[name].length };
+    },
+    'POST /api/lists/delete': (uid, _p, b) => {
+      const kind = kindOf(b.kind); listNeed(uid, kind); const { store, name } = getList(uid, kind, b.name);
+      delete store[name]; W.save(uid, fileOf(kind), store); W.logActivity(uid, 'app-delete-list', name, kind); return { ok: true };
     },
     'GET /api/groups': (uid, _p, _b, q) => {
       need(uid, '✉️ Messages');
