@@ -374,6 +374,29 @@ export async function cleanContacts(uid) {
   save(uid, 'exclude', [...new Set(load(uid, 'exclude', []).map(x => map[x] || x))]);
   save(uid, 'contacts', C); save(uid, 'lists', L); return { merged, removed };
 }
+const deadErr = e => /gone|revoked|not-found|invalid|expired|bad-request/i.test(String(e?.message)) || [400, 404, 410].includes(e?.output?.statusCode);
+export async function linkInfo(uid, code) {                         // what group is behind this invite link?
+  const sock = socks[uid]; if (!sock?.user || !up[uid]) throw new Error('WhatsApp is not connected right now.');
+  try { const i = await sock.groupGetInviteInfo(code); return { subject: i.subject || '', size: i.size ?? i.participants?.length ?? 0, desc: String(i.desc || '').slice(0, 200), joined: !!load(uid, 'groups', {})[i.id] }; }
+  catch (e) { throw new Error(deadErr(e) ? 'This link is dead or was revoked.' : 'Could not check this link right now.'); }
+}
+export async function joinLink(uid, code) {                         // joining many groups quickly gets numbers restricted: slow and capped on purpose
+  const sock = socks[uid]; if (!sock?.user || !up[uid]) throw new Error('WhatsApp is not connected right now.');
+  if (isYoung(uid)) throw new Error('Wait about an hour after linking before joining groups. WhatsApp can remove a brand-new device that does this too early.');
+  const pf = prof(uid), day = new Date().toISOString().slice(0, 10); if (pf.joins?.day !== day) pf.joins = { day, n: 0, last: 0 };
+  if (pf.joins.n >= 10) throw new Error('You can join 10 groups a day. Joining too many too fast can get a number restricted.');
+  if (Date.now() - pf.joins.last < 20000) throw new Error('Wait a few seconds between joins.');
+  pf.joins.n++; pf.joins.last = Date.now(); save(uid, 'profile', pf);
+  try { await sock.groupAcceptInvite(code); }
+  catch (e) {
+    pf.joins.n--; save(uid, 'profile', pf); const m = String(e?.message || '');                       // a failed join does not use up the daily allowance
+    if (/conflict|already/i.test(m)) throw new Error('You are already in this group.');
+    if (deadErr(e)) throw new Error('This link is dead or was revoked.');
+    if (/not-authorized|forbidden|403/i.test(m)) throw new Error('WhatsApp would not let you join. You may have been removed from this group.');
+    throw new Error('Could not join right now. Try again in a minute.');
+  }
+  return true;
+}
 export async function checkLinks(uid) {
   const sock = socks[uid];
   if (!sock?.user) throw new Error('WhatsApp is not connected');

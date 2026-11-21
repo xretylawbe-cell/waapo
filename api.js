@@ -74,7 +74,7 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
   };
   const upload = async (uid, req, q) => {
     need(uid, '✍️ Post'); const type = String(q.get('type') || ''); if (!has(UP, type)) throw E(400, 'Unknown file type.');
-    if (limited('up:' + uid, 10)) throw E(429, 'Too many uploads. Please wait a minute.');
+    if (limited('up:' + uid, 60)) throw E(429, 'Too many uploads. Please wait a minute.');
     if (Number(req.headers['content-length'] || 0) > UP[type].max) throw E(413, `That file is too big. The limit is ${UP[type].max / 1e6} MB.`);
     const chunks = []; let n = 0;
     await new Promise((ok, bad) => { req.on('data', c => { n += c.length; if (n > UP[type].max) { bad(E(413, `That file is too big. The limit is ${UP[type].max / 1e6} MB.`)); req.destroy(); } else chunks.push(c); }); req.on('end', ok); req.on('error', () => bad(E(400, 'The upload was interrupted.'))); });
@@ -99,7 +99,12 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
     if (early instanceof Error) throw E(400, early.message);
     run.catch(() => {}); return { started: true };
   };
-  const unsending = new Set();
+  const unsending = new Set(), checking = new Set(), GRP = /^[A-Za-z0-9]{18,26}$/;
+  const csvCell = v => `"${String(v ?? '').replace(/"/g, '""')}"`, toCsv = rows => '\uFEFF' + rows.map(r => r.map(csvCell).join(',')).join('\r\n');
+  const sendFile = async (uid, text, name, cap) => { try { await bot.sendFile(uid, text, name, cap); } catch { throw E(502, 'Could not send the file to your chat. Open the bot and send /start first.'); } };
+  const fmtD = t => t ? new Date(t).toISOString().slice(0, 16).replace('T', ' ') : '';
+  const chatLinks = uid => { const G = W.load(uid, 'groups', {}); return Object.entries(W.load(uid, 'links_seen', {})).map(([code, l]) => ({ code, url: l.url || 'https://chat.whatsapp.com/' + code, where: l.group ? (G[l.group]?.subject || 'A group') : 'A private chat', at: l.at || 0 })).sort((a, b) => b.at - a.at); };
+  const deadLinks = uid => Object.entries(W.load(uid, 'dead_links', {})).map(([code, d]) => ({ code, url: d.url || 'https://chat.whatsapp.com/' + code, where: d.groupName || '', at: d.detectedAt || 0 })).sort((a, b) => b.at - a.at);
   const RESERVED = /^(__proto__|constructor|prototype|tostring|hasownproperty|valueof)$/i, CAP = { numbers: 5000, groups: 500 };
   const kindOf = k => { if (k !== 'numbers' && k !== 'groups') throw E(400, 'Unknown list type.'); return k; };
   const fileOf = kind => (kind === 'groups' ? 'grouplists' : 'lists');
@@ -125,7 +130,7 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
           scheduledPosts: W.load(uid, 'posts', []).filter(x => x.status === 'scheduled').length, scheduledMessages: W.load(uid, 'msgs', []).filter(x => x.status === 'scheduled').length,
           lists: Object.keys(W.load(uid, 'lists', {})).length + Object.keys(W.load(uid, 'grouplists', {})).length
         },
-        features: { post: canSee(uid, '✍️ Post'), schedule: canSee(uid, '🗓 Schedule a post'), messages: canSee(uid, '✉️ Messages'), sending: canSee(uid, '📡 Sending now'), lists: canSee(uid, '🏷 Lists'), glists: canSee(uid, '📚 Group lists'), inbox: canSee(uid, '📩 Inbox'), tpl: canSee(uid, '📋 My templates'), col: canSee(uid, '⭐ Saved colours'), unsend: canSee(uid, '🗑 Delete a sent post'), media: canSee(uid, '🖼 Image'), ref: canSee(uid, '🎁 Refer a friend'), groups: canSee(uid, '👪 Groups & links'), excl: canSee(uid, '🚫 Exclusions'), plan: canSee(uid, '💳 Plan'), insights: canSee(uid, '📊 Insights') }
+        features: { post: canSee(uid, '✍️ Post'), schedule: canSee(uid, '🗓 Schedule a post'), messages: canSee(uid, '✉️ Messages'), sending: canSee(uid, '📡 Sending now'), lists: canSee(uid, '🏷 Lists'), glists: canSee(uid, '📚 Group lists'), inbox: canSee(uid, '📩 Inbox'), tpl: canSee(uid, '📋 My templates'), links: canSee(uid, '🔗 Group links'), deadl: canSee(uid, '🧾 Review dead links'), clean: canSee(uid, '🧹 Clean dead links'), exportn: canSee(uid, '📤 Export numbers'), dedupe: canSee(uid, '🧹 Fix duplicates'), admin: canSee(uid, '🛠 Admin'), au: canSee(uid, '📋 List users'), ap: canSee(uid, '🕒 Pending'), contacts: canSee(uid, '📈 Summary'), reach: canSee(uid, '📊 Reach-out stats'), queue: canSee(uid, '🗂 Queue many'), col: canSee(uid, '⭐ Saved colours'), unsend: canSee(uid, '🗑 Delete a sent post'), media: canSee(uid, '🖼 Image'), ref: canSee(uid, '🎁 Refer a friend'), groups: canSee(uid, '👪 Groups & links'), excl: canSee(uid, '🚫 Exclusions'), plan: canSee(uid, '💳 Plan'), insights: canSee(uid, '📊 Insights') }
       };
     },
     'GET /api/posts': uid => {
@@ -150,6 +155,144 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
       const name = String(body.saveAs ?? '').replace(/[\u0000-\u001f]/g, '').trim().slice(0, 30);
       if (name && canSee(uid, '📄 Templates')) { const T = W.load(uid, 'templates', []); if (T.length < 30) { T.push({ name, p: { ...p, id: undefined } }); W.save(uid, 'templates', T); } }
       const out = await launch(uid, p, body); if (kind !== 'text') pend.delete(uid + ':' + body.upload); return out;
+    },
+    'POST /api/queue': async (uid, _p, b) => {                          // many files, one every N hours: same as the bot's Queue many
+      need(uid, '🗂 Queue many'); if (!W.linked(uid)) throw E(400, 'Link WhatsApp first.');
+      const items = Array.isArray(b.items) ? b.items : []; if (!items.length) throw E(400, 'Add at least one file.'); if (items.length > 50) throw E(400, 'The queue limit is 50 files.');
+      const gap = [1, 6, 12, 24].includes(Number(b.gap)) ? Number(b.gap) * 36e5 : null; if (!gap) throw E(400, 'Pick how often to post.');
+      const at = futureAt(b.at), pf = W.prof(uid), base = Date.now(), made = [];
+      items.forEach((it, i) => {
+        const type = has(UP, it?.type) ? it.type : null; if (!type) throw E(400, `File ${i + 1} has an unknown type.`);
+        const caption = String(it.caption ?? '').trim(); if (caption.length > 700) throw E(400, `Caption ${i + 1} is over 700 characters.`);
+        const p = { type, file: takeUpload(uid, it.upload, type), ...(type !== 'audio' && caption ? { caption } : {}), bg: pf.color, tc: pf.textColor, font: pf.font, aud: 'all', exclude: [], excludeLists: [], excludeGroups: [], id: base + i, at: at + i * gap, repeat: 'none', status: 'scheduled' };
+        const sg = W.checkSpam(uid, p); if (!sg.ok) throw E(400, `Post ${i + 1} ${sg.reason}.`); made.push(p);
+      });
+      const P = W.load(uid, 'posts', []); P.push(...made); W.save(uid, 'posts', P); items.forEach(it => pend.delete(uid + ':' + it.upload)); W.logActivity(uid, 'app-queue-many', made.length);
+      return { scheduled: made.length, first: at, last: made.at(-1).at };
+    },
+    'GET /api/contacts': uid => {
+      need(uid, '📈 Summary'); const E = Object.entries(W.load(uid, 'contacts', {})), act = E.filter(([, c]) => !c.out), by = k => act.filter(([, c]) => c.src === k).length;
+      return { total: act.length, phonebook: by('phonebook'), chats: by('chat'), viewers: by('viewer'), groupOnly: by('group'), multi: act.filter(([, c]) => (c.gc || 0) > 1).length, removed: E.length - act.length };
+    },
+    'GET /api/contacts/views': uid => {
+      need(uid, '👁 Who views me'); const C = W.load(uid, 'contacts', {}), V = W.load(uid, 'views', { log: [] }), H = W.load(uid, 'history', []);
+      const list = Object.entries(C).filter(([, c]) => c.v > 0).sort((a, b) => b[1].v - a[1].v), last = {};
+      for (let i = (V.log || []).length - 1; i >= 0; i--) if (!(V.log[i].who in last)) last[V.log[i].who] = V.log[i];
+      return { total: list.length, people: list.slice(0, 200).map(([n, c]) => ({ number: n, name: c.name || '', views: c.v, last: c.lastView || 0, post: H.find(h => h.id === last[n]?.post)?.preview || '' })) };
+    },
+    'GET /api/contacts/posts': uid => {
+      need(uid, '👁 Post viewers');
+      return { posts: W.load(uid, 'history', []).slice(-10).reverse().map(h => ({ id: h.id, at: h.at, preview: String(h.preview || ''), views: h.viewers?.length || 0 })) };
+    },
+    'GET /api/contacts/posts/:id': (uid, { id }) => {
+      need(uid, '👁 Post viewers'); const h = W.load(uid, 'history', []).find(x => String(x.id) === id); if (!h) throw E(404, 'That post was not found.');
+      const C = W.load(uid, 'contacts', {}), v = h.viewers || [];
+      return { preview: String(h.preview || ''), at: h.at, total: v.length, viewers: v.slice(0, 200).map(n => ({ number: n, name: C[n]?.name || '' })) };
+    },
+    'GET /api/contacts/inactive': uid => {
+      need(uid, '😴 Inactive 6m'); const r = W.inactiveReport(uid), C = W.load(uid, 'contacts', {});
+      if (!r.ok) return { ok: false, tracked: r.tracked, posts: r.posts };
+      return { ok: true, total: r.list.length, list: r.list.slice(0, 200).map(n => ({ number: n, name: C[n]?.name || '', views: C[n]?.v || 0, last: C[n]?.lastView || 0 })) };
+    },
+    'POST /api/contacts/prune': uid => { need(uid, '😴 Inactive 6m'); const n = W.prune(uid); W.logActivity(uid, 'app-prune-inactive', n); return { ok: true, removed: n }; },
+    'GET /api/reach': uid => {
+      need(uid, '📊 Reach-out stats'); const r = W.reachState(uid), C = Object.values(W.load(uid, 'contacts', {})), max = bot.reachMax?.() ?? 10;
+      return { on: !!r.on, perDay: Math.min(r.perDay, max), max, today: r.n || 0, total: r.total || 0, replies: r.replies || 0, minDays: r.minDays,
+        viewed: C.filter(c => c.reachedAt && c.lastView > c.reachedAt).length, optOut: C.filter(c => c.optOut).length,
+        msgs: r.msgs?.length ? r.msgs : W.REACH_DEFAULT, custom: !!r.msgs?.length, can: { toggle: canSee(uid, '🔛 Reach-out on/off'), msgs: canSee(uid, '✏️ Reach-out messages'), per: canSee(uid, '🔢 Reach-out per day') } };
+    },
+    'POST /api/reach/toggle': (uid, _p, b) => {
+      need(uid, '🔛 Reach-out on/off'); const r = W.reachState(uid);
+      if (b.on) { r.on = true; r.nextAt = Date.now() + 5 * 60e3; } else r.on = false;
+      W.save(uid, 'profile', W.prof(uid)); W.logActivity(uid, 'app-reach-' + (r.on ? 'on' : 'off')); return { ok: true, on: r.on };
+    },
+    'POST /api/reach/settings': (uid, _p, b) => {
+      const r = W.reachState(uid), max = bot.reachMax?.() ?? 10;
+      if (b.perDay !== undefined) { need(uid, '🔢 Reach-out per day'); const n = Number(b.perDay); if (!Number.isInteger(n) || n < 1 || n > max) throw E(400, `Pick a whole number from 1 to ${max}.`); r.perDay = n; }
+      if (b.msgs !== undefined) {
+        need(uid, '✏️ Reach-out messages'); const m = (Array.isArray(b.msgs) ? b.msgs : []).map(x => String(x).trim()).filter(x => x.length >= 8 && x.length <= 300).slice(0, 5);
+        if (Array.isArray(b.msgs) && b.msgs.some(x => String(x).trim()) && !m.length) throw E(400, 'Each message needs 8 to 300 characters.'); r.msgs = m;
+      }
+      W.save(uid, 'profile', W.prof(uid)); return { ok: true };
+    },
+    // ---- admin: every route re-checks the admin's own permission, exactly like the bot's menus ----
+    'GET /api/admin/users': uid => {
+      need(uid, '📋 List users'); const all = W.users();
+      const users = all.slice(-300).reverse().map(id => { const p = W.prof(id); return { id, name: p.name || '', linked: W.linked(id), up: W.isUp(id), status: p.paused ? 'paused' : W.expired(p) ? 'expired' : 'active' }; });
+      return { total: all.length, users };
+    },
+    'GET /api/admin/users/:id': (uid, { id }) => {
+      need(uid, 'ℹ️ User info'); if (!/^\d{1,20}$/.test(id) || !W.users().includes(id)) throw E(404, 'That user was not found.');
+      const p = W.prof(id), L = a => canSee(uid, a);
+      return { id, name: p.name || '', username: p.username || '', linked: W.linked(id), up: W.isUp(id), status: p.paused ? 'paused' : W.expired(p) ? 'expired' : 'active', limit: p.limit, today: p.sent?.n || 0, expires: p.expires || null, plan: p.plan || '', role: W.isOwner(id) ? 'owner' : isAdm(id) ? 'admin' : 'user', health: String(W.healthSummary(id) || ''),
+        can: { pause: L('⏸ Pause'), resume: L('▶️ Resume'), limit: L('🔢 Set limit'), days: L('⏳ Add days'), repair: L('🧽 Repair user'), unlink: L('🔌 Force unlink'), remove: L('🗑 Remove user') } };
+    },
+    'POST /api/admin/users/:id/action': async (uid, { id }, b) => {
+      const LAB = { pause: '⏸ Pause', resume: '▶️ Resume', limit: '🔢 Set limit', days: '⏳ Add days', repair: '🧽 Repair user', unlink: '🔌 Force unlink', remove: '🗑 Remove user' };
+      if (!has(LAB, b.action)) throw E(400, 'Unknown action.'); need(uid, LAB[b.action]);
+      if (!/^\d{1,20}$/.test(id) || !W.users().includes(id)) throw E(404, 'That user was not found.');
+      if (W.isOwner(id) && !W.isOwner(uid)) throw E(403, 'Only the owner can change the owner account.');
+      if (b.action === 'remove' && id === uid) throw E(400, 'You cannot remove your own account here.');
+      W.logActivity(uid, `user:${b.action}`, id, String(b.value ?? '')); const p = W.prof(id), n = Number(b.value);
+      switch (b.action) {
+        case 'pause': case 'resume': p.paused = b.action === 'pause'; W.save(id, 'profile', p); return { ok: true };
+        case 'limit': if (!Number.isInteger(n) || n < 1 || n > 10000) throw E(400, 'The limit must be a whole number from 1 to 10000.'); p.limit = n; W.save(id, 'profile', p); return { ok: true };
+        case 'days': if (!Number.isInteger(n) || n < 1 || n > 3650) throw E(400, 'Enter a whole number of days from 1 to 3650.'); p.expires = Math.max(Date.now(), p.expires || 0) + n * 864e5; W.save(id, 'profile', p); return { ok: true };
+        case 'repair': return { ok: true, cleared: await W.repairSession(id) };
+        case 'unlink': await W.unlink(id); return { ok: true };
+        case 'remove': await W.unlink(id); W.dropUser(id); return { ok: true };
+      }
+    },
+    'GET /api/admin/payments': uid => {
+      need(uid, '🕒 Pending');
+      return { pending: W.load('_g', 'pending_payments', []).filter(x => x.status === 'pending').slice(-50).reverse().map(x => ({ uid: String(x.uid), at: x.at, plan: x.planName || '', price: x.price || '', days: x.days || null })) };
+    },
+    'POST /api/admin/payments/decide': async (uid, _p, b) => {
+      const ok = b.action === 'approve'; if (!ok && b.action !== 'decline') throw E(400, 'Unknown action.'); need(uid, ok ? '✅ Approve' : '❌ Decline');
+      const all = W.load('_g', 'pending_payments', []), item = [...all].reverse().find(x => String(x.uid) === String(b.uid) && x.status === 'pending');
+      if (!item) throw E(404, 'That receipt was already handled.');
+      if (!ok) { item.status = 'declined'; item.reviewedAt = Date.now(); W.save('_g', 'pending_payments', all); W.logActivity(uid, 'payment-declined', String(item.uid)); bot.declinedNotice?.(item.uid); return { ok: true }; }
+      const n = Number(b.days ?? item.days); if (!Number.isInteger(n) || n < 1 || n > 3650) throw E(400, 'Enter a whole number of days from 1 to 3650.');
+      const t = String(item.uid), p = W.prof(t); p.expires = Math.max(Date.now(), p.expires || 0) + n * 864e5; p.expNotified = false; if (item.planName) p.plan = item.planName; delete p.pendingPlan; W.save(t, 'profile', p);
+      W.rewardReferrer(t); item.status = 'approved'; item.reviewedAt = Date.now(); item.daysGranted = n; W.logActivity(uid, 'payment-approved', t, `${item.planName || ''} ${n}d`);
+      W.save('_g', 'pending_payments', all); bot.approvedNotice?.(t, item.planName, n); return { ok: true, days: n };
+    },
+    'POST /api/contacts/export': async uid => {
+      need(uid, '📤 Export numbers'); const rows = Object.entries(W.load(uid, 'contacts', {})).filter(([n]) => /^\d{7,15}$/.test(n)); if (!rows.length) throw E(400, 'No contacts yet.');
+      await sendFile(uid, toCsv([['Name', 'Phone', 'Source', 'Groups in', 'Status views', 'In audience'], ...rows.map(([n, c]) => [c.name || '', '+' + n, c.src || '', c.gc || 0, c.v || 0, c.out ? 'no' : 'yes'])]), 'contacts.csv', `📤 ${rows.length} unique contacts. Opens in Excel or Sheets.`);
+      await sendFile(uid, rows.map(([n, c]) => `BEGIN:VCARD\nVERSION:3.0\nFN:${(c.name || '+' + n).replace(/[\r\n]/g, ' ')}\nTEL;TYPE=CELL:+${n}\nEND:VCARD`).join('\n'), 'contacts.vcf', 'Imports straight into your phone contacts.');
+      W.logActivity(uid, 'app-export-contacts', rows.length); return { ok: true, total: rows.length };
+    },
+    'POST /api/contacts/dedupe': async uid => { need(uid, '🧹 Fix duplicates'); const r = await W.cleanContacts(uid); W.logActivity(uid, 'app-fix-duplicates', r.merged); return r; },
+    'GET /api/links/chat': (uid, _p, _b, q) => {
+      need(uid, '🔗 Group links'); const s = String(q.get('q') || '').toLowerCase().slice(0, 60); let all = chatLinks(uid); if (s) all = all.filter(x => x.url.toLowerCase().includes(s) || x.where.toLowerCase().includes(s));
+      const per = 20, pages = Math.max(1, Math.ceil(all.length / per)), page = Math.min(Math.max(1, Number(q.get('page')) || 1), pages);
+      return { total: all.length, page, pages, items: all.slice((page - 1) * per, page * per) };
+    },
+    'POST /api/links/info': async (uid, _p, b) => {
+      need(uid, '🔗 Group links'); const code = String(b.code || ''); if (!GRP.test(code)) throw E(400, 'That is not a valid group link.');
+      try { return await W.linkInfo(uid, code); } catch (e) { throw E(400, e.message); }
+    },
+    'POST /api/links/join': async (uid, _p, b) => {
+      need(uid, '🔗 Group links'); const code = String(b.code || ''); if (!GRP.test(code)) throw E(400, 'That is not a valid group link.');
+      try { await W.joinLink(uid, code); } catch (e) { throw E(400, e.message); } W.logActivity(uid, 'app-join-group', code); return { ok: true };
+    },
+    'GET /api/links/dead': uid => { need(uid, '🧾 Review dead links'); return { items: deadLinks(uid).slice(0, 200), total: deadLinks(uid).length, checking: checking.has(uid) }; },
+    'POST /api/links/dead/delete': (uid, _p, b) => {
+      need(uid, '🧾 Review dead links'); const D = W.load(uid, 'dead_links', {}), code = String(b.code || ''); if (!has(D, code)) throw E(404, 'That link was already removed.');
+      delete D[code]; W.save(uid, 'dead_links', D); return { ok: true };
+    },
+    'POST /api/links/check': async uid => {
+      need(uid, '🧹 Clean dead links'); if (checking.has(uid)) throw E(400, 'Already checking your links.'); if (!W.isUp(uid)) throw E(400, 'WhatsApp is not connected right now.');
+      checking.add(uid); W.checkLinks(uid).then(n => W.logActivity(uid, 'app-check-links', n), () => {}).finally(() => checking.delete(uid)); return { started: true };
+    },
+    'POST /api/links/export': async (uid, _p, b) => {
+      need(uid, '🔗 Group links'); const kind = String(b.kind || ''); let rows, head, name;
+      if (kind === 'chat') { head = ['Link', 'Found in', 'Found on']; name = 'chat-links.csv'; rows = chatLinks(uid).map(x => [x.url, x.where, fmtD(x.at)]); }
+      else if (kind === 'groups') { head = ['Group', 'Link', 'Members']; name = 'group-links.csv'; rows = Object.values(W.load(uid, 'groups', {})).filter(g => g.link).map(g => [g.subject || '', g.link, g.size || 0]); }
+      else if (kind === 'dead') { need(uid, '🧾 Review dead links'); head = ['Link', 'Group', 'Found dead on']; name = 'dead-links.csv'; rows = deadLinks(uid).map(x => [x.url, x.where, fmtD(x.at)]); }
+      else throw E(400, 'Unknown list.'); if (!rows.length) throw E(400, 'There is nothing to send yet.');
+      await sendFile(uid, toCsv([head, ...rows]), name, `🔗 ${rows.length} links`); return { ok: true, total: rows.length };
     },
     'GET /api/templates': uid => {
       need(uid, '📋 My templates');
