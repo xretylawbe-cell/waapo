@@ -1809,7 +1809,7 @@ function main() {
     const ping = () => fetch(process.env.PROXY_URL.replace(/\/$/, '') + '/healthz', { signal: AbortSignal.timeout(20000) }).catch(() => {});
     ping(); setInterval(ping, 9 * 60e3).unref();
   }
-  if (process.env.MINIAPP_ORIGIN) startApi({ port: Number(process.env.MINIAPP_PORT || 3000), origins: process.env.MINIAPP_ORIGIN.split(',').map(x => x.trim().replace(/\/$/, '')).filter(Boolean), token: CFG.token, W, canSee, isAdm, build: BUILD });
+  if (process.env.MINIAPP_ORIGIN) startApi({ port: Number(process.env.MINIAPP_PORT || 3000), origins: process.env.MINIAPP_ORIGIN.split(',').map(x => x.trim().replace(/\/$/, '')).filter(Boolean), token: CFG.token, W, canSee, isAdm, build: BUILD, bot: { hasAdmin: () => !!CFG.admin, notifyAdmin: text => tg.sendMessage(CFG.admin, text, { parse_mode: 'HTML' }), esc, refDays: () => Number(CFG.refDays ?? 7), refLink: u => botUser ? `https://t.me/${botUser}?start=ref_${Number(u).toString(36)}` : '' } });
   // Telegraf's launch promise remains pending for as long as polling runs.
   // Use its onLaunch callback for startup work instead of awaiting that promise.
   bot.launch({ allowedUpdates: ['message', 'edited_message', 'callback_query', 'my_chat_member', 'poll', 'poll_answer', 'message_reaction'] }, () => {
