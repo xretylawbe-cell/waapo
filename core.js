@@ -153,6 +153,7 @@ async function addC(uid, sock, arr, src, group) {
   return got;
 }
 
+export const linkState = {};                                        // pairing code waiting to be typed on the phone, so the Mini App can show it
 const SETTLE = 60 * 60e3, gTimer = {};
 const isYoung = uid => Date.now() - (prof(uid).linkedAt || 0) < SETTLE;
 const maxSessions = () => { const mb = (process.constrainedMemory?.() || os.totalmem()) / 1048576; return Number(E.MAX_SESSIONS) || Math.max(5, Math.floor((mb - 250) / 60)); };   // ≈60 MB per live session

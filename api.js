@@ -220,6 +220,33 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
     },
     'GET /api/jobs': uid => { need(uid, '📡 Sending now'); return { jobs: W.activeJobs(uid).map(j => ({ id: j.id, type: j.type, preview: j.preview, total: j.total, sent: j.sent, started: j.started, stopping: !!j.cancel })) }; },
     'POST /api/jobs/:id/stop': (uid, { id }) => { need(uid, '📡 Sending now'); const n = W.cancelJobs(uid, id); if (!n) throw E(404, 'That send already finished.'); W.logActivity(uid, 'app-stop-send', id); return { ok: true }; },
+    'GET /api/account': uid => {
+      const p = W.prof(uid), me = W.waMe(uid), ls = W.linkState[uid];
+      return {
+        wa: { linked: W.linked(uid), up: W.isUp(uid), number: me?.number || '' }, alerts: !!p.alerts, weekly: !!p.weekly, autoPrune: !!p.autoPrune,
+        can: { alerts: canSee(uid, '🔔 Toggle alerts'), weekly: canSee(uid, '📰 Toggle weekly report'), prune: canSee(uid, '🧹 Toggle auto-prune'), repair: canSee(uid, '🧽 Repair session') },
+        health: W.load(uid, 'health', { events: [] }).events.slice(-8).reverse().map(e => ({ t: e.t, kind: e.kind, detail: e.detail || '' })),
+        code: ls && Date.now() - ls.t < 170000 ? ls.code : null
+      };
+    },
+    'POST /api/account/toggle': (uid, _p, b) => {
+      const map = { alerts: '🔔 Toggle alerts', weekly: '📰 Toggle weekly report', autoPrune: '🧹 Toggle auto-prune' };
+      if (!has(map, b.key)) throw E(400, 'Unknown setting.'); need(uid, map[b.key]);
+      const p = W.prof(uid); p[b.key] = !p[b.key]; W.save(uid, 'profile', p); return { ok: true, value: p[b.key] };
+    },
+    'POST /api/link': async (uid, _p, b) => {                          // same pairing-code flow as the bot's Phone code button
+      if (W.isUp(uid)) throw E(400, 'WhatsApp is already connected.');
+      const n = parseNumbers(b.phone).items[0]; if (!n) throw E(400, 'Enter your WhatsApp number with country code.');
+      delete W.linkState[uid];
+      const run = W.connect(uid, 'code', n); run.catch(() => {});
+      try { await Promise.race([run, sleep(1500)]); } catch (e) { throw E(400, e.message || 'Could not start linking.'); }
+      return { ok: true };
+    },
+    'POST /api/repair': async uid => {
+      need(uid, '🧽 Repair session'); if (!W.linked(uid)) throw E(400, 'WhatsApp is not linked.');
+      try { return { ok: true, cleared: await W.repairSession(uid) }; } catch { throw E(500, 'Could not repair the session. Try linking again.'); }
+    },
+    'POST /api/unlink': async uid => { await W.unlink(uid); return { ok: true }; },
     'GET /api/lists': uid => {
       need(uid, '🏷 Lists');
       const row = ([name, v]) => ({ name, count: v.length });

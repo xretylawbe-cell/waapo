@@ -261,8 +261,9 @@ hooks.qr = async (uid, buf) => {
   const s = St(uid), m = await tg.sendPhoto(uid, { source: buf }, { caption: 'Scan: WhatsApp → Linked devices → Link a device. Each QR stays valid ~2 minutes; the newest one is the live one.', ...keyboardFor(uid) });
   if (s.qrMsg) tg.deleteMessage(uid, s.qrMsg).catch(() => {}); s.qrMsg = m.message_id;
 };
-hooks.code = async (uid, code) => { const s = St(uid), m = await tg.sendMessage(uid, `🔢 Your code: <code>${code.match(/.{1,4}/g).join('-')}</code>\nWhatsApp → Linked devices → Link with phone number. It will not be regenerated.`, { parse_mode: 'HTML', ...keyboardFor(uid) }); s.codeMsg = m.message_id; };
+hooks.code = async (uid, code) => { W.linkState[uid] = { code, t: Date.now() }; const s = St(uid), m = await tg.sendMessage(uid, `🔢 Your code: <code>${code.match(/.{1,4}/g).join('-')}</code>\nWhatsApp → Linked devices → Link with phone number. It will not be regenerated.`, { parse_mode: 'HTML', ...keyboardFor(uid) }); s.codeMsg = m.message_id; };
 hooks.opened = async uid => {
+  delete W.linkState[uid];
   const s = St(uid); for (const k of ['qrMsg', 'codeMsg']) if (s[k]) { tg.deleteMessage(uid, s[k]).catch(() => {}); s[k] = null; }
   s.nav = ['home']; reset(s);
   s.keyboardRows = MENUS.home.rows(uid);
