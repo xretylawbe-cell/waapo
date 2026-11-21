@@ -71,7 +71,7 @@ export const expired = p => CFG.require ? (!p.expires || Date.now() > p.expires)
 const argb = h => parseInt('FF' + h.replace('#', ''), 16);
 
 // ---------- WhatsApp sessions ----------
-const socks = {}, gen = {}, tries = {}, up = {}, alerted = {}, repairs = {}, sentMsgs = new Map(), pendingCode = {}, lastCodeReq = {}, loggedOutOnce = {}, stableT = {};
+const openAt = {}, socks = {}, gen = {}, tries = {}, up = {}, alerted = {}, repairs = {}, sentMsgs = new Map(), pendingCode = {}, lastCodeReq = {}, loggedOutOnce = {}, stableT = {};
 export const isUp = u => !!up[u];
 const isPairedCreds = c => !!(c?.me && (c.account || (Array.isArray(c.signalIdentities) && c.signalIdentities.length)));   // set by pair-success only
 export const linked = u => { for (const n of ['creds.json', 'creds.bak']) { try { if (isPairedCreds(JSON.parse(fs.readFileSync(`${DATA}/${u}/auth/${n}`)))) return true; } catch {} } return false; };   // creds.bak = safety copy, survives a half-written creds.json
@@ -101,7 +101,7 @@ waVersion();                                                      // warm the ca
 const wipe = u => { fs.rmSync(`${DATA}/${u}/auth`, { recursive: true, force: true }); try { const p = prof(u); p.welcomed = false; save(u, 'profile', p); } catch {} };
 
 const badBuf = {}, lastAuto = {}, closes = {};
-export function logHealth(uid, kind, detail) { const h = load(uid, 'health', { events: [] }); h.events.push({ t: Date.now(), kind, detail: String(detail ?? '').slice(0, 80) }); h.events = h.events.slice(-30); save(uid, 'health', h); }
+export function logHealth(uid, kind, detail) { const h = load(uid, 'health', { events: [] }); h.events.push({ t: Date.now(), kind, detail: String(detail ?? '').slice(0, 150) }); h.events = h.events.slice(-30); save(uid, 'health', h); }
 export function healthSummary(uid) {
   const ev = load(uid, 'health', { events: [] }).events.slice(-6).reverse();
   return ev.length ? ev.map(e => `${fmt(e.t)} — ${e.kind}${e.detail ? ' ' + e.detail : ''}`).join('\n') : 'No problems recorded.';
@@ -153,6 +153,8 @@ async function addC(uid, sock, arr, src, group) {
   return got;
 }
 
+const SETTLE = 60 * 60e3, gTimer = {};
+const isYoung = uid => Date.now() - (prof(uid).linkedAt || 0) < SETTLE;
 const maxSessions = () => { const mb = (process.constrainedMemory?.() || os.totalmem()) / 1048576; return Number(E.MAX_SESSIONS) || Math.max(5, Math.floor((mb - 250) / 60)); };   // ≈60 MB per live session
 export const sessionCapacity = () => ({ live: Object.keys(up).filter(k => up[k]).length, max: maxSessions() });
 export async function connect(uid, mode = 'resume', phone = '') {
@@ -209,19 +211,21 @@ export async function connect(uid, mode = 'resume', phone = '') {
       }
     }
     if (connection === 'open') {
-      up[uid] = true; tries[uid] = 0; mode = 'resume'; delete pendingCode[uid]; loggedOutOnce[uid] = 0;
+      up[uid] = true; openAt[uid] = Date.now(); tries[uid] = 0; mode = 'resume'; delete pendingCode[uid]; loggedOutOnce[uid] = 0;
       clearTimeout(stableT[uid]); stableT[uid] = setTimeout(() => { repairs[uid] = 0; }, 15 * 60e3); stableT[uid].unref?.();   // a stable session earns a clean slate
       const pf = prof(uid);
       if (pf.welcomed === undefined && Date.now() - (pf.created || 0) > 15 * 60e3) { pf.welcomed = true; save(uid, 'profile', pf); }   // existing users: no surprise message
       else if (!pf.welcomed) { pf.welcomed = true; pf.linkedAt = Date.now(); save(uid, 'profile', pf); hooks.opened(uid); }      // first open after a real link
       else if (alerted[uid]) { alerted[uid] = false; hooks.note(uid, '🟢 WhatsApp reconnected.'); }
-      scheduleGroupSync(uid, 20000);                              // every open: sync if never synced or older than 24 h
+      const age = Date.now() - (pf.linkedAt || 0);                // a brand-new linked device that immediately pulls 500 groups looks like abuse to WhatsApp and gets removed (device_removed)
+      scheduleGroupSync(uid, age < SETTLE ? SETTLE - age + rnd(0, 120000) : 20000);   // new link: wait ~1 h. otherwise sync if never synced or older than 24 h
     }
     if (connection === 'close') {
       up[uid] = false;
       const err = lastDisconnect?.error, code = err?.output?.statusCode, msg = String(err?.message || '');
       const isAck = /\(ack\)/i.test(msg);                          // the known 50-minute status-ack drop: harmless, just reconnect
-      logHealth(uid, isAck ? 'reconnect' : 'disconnected', `code ${code ?? '?'} ${msg}${err?.data ? ' ' + JSON.stringify(err.data).slice(0, 60) : ''}`);
+      const ranMin = openAt[uid] ? Math.round((Date.now() - openAt[uid]) / 6e4) : '?'; let why = ''; try { const n = err?.data?.content?.[0] || err?.data; why = n ? JSON.stringify(n.attrs || n.tag || n).slice(0, 70) : ''; } catch {}
+      logHealth(uid, isAck ? 'reconnect' : 'disconnected', `code ${code ?? '?'} after ${ranMin}m ${msg} ${why}`);   // 401+conflict/device_removed = WhatsApp removed it; 440 = same login running twice
       if (!paired()) {                                             // the link itself did not finish: remove anything half-done
         delete pendingCode[uid]; delete socks[uid]; wipe(uid);
         return hooks.note(uid, '⌛ The link did not finish. Tap 📲 Link WhatsApp and try again — tap it once, then enter the new code straight away.');
@@ -280,7 +284,10 @@ export async function connect(uid, mode = 'resume', phone = '') {
       }
     }
   });
-  sock.ev.on('groups.upsert', () => refreshGroups(uid).catch(() => {}));
+  sock.ev.on('groups.upsert', () => {                          // WhatsApp fires this in bursts (and right after linking): never run a full refresh per event
+    if (gen[uid] !== my || isYoung(uid)) return;
+    clearTimeout(gTimer[uid]); gTimer[uid] = setTimeout(() => { if (up[uid]) refreshGroups(uid).catch(() => {}); }, 120000); gTimer[uid].unref?.();
+  });
   sock.ev.on('message-receipt.update', async ups => {       // who viewed my status
     if (gen[uid] !== my) return;
     const V = load(uid, 'views', { log: [] }), c = load(uid, 'contacts', {}), H = load(uid, 'history', []);
@@ -338,7 +345,10 @@ export async function refreshGroups(uid) {
     const o = G[x.id] ??= {}; o.subject = x.subject || ''; o.size = x.participants.length;
     o.role = x.participants.find(isMe)?.admin ? 'admin' : 'member'; o.community = !!(x.isCommunity || x.linkedParent);
     if (x.creation) o.created = x.creation * 1000;
-    if (!o.link) { try { const code = await sock.groupInviteCode(x.id); if (code) o.link = 'https://chat.whatsapp.com/' + code; } catch {} await sleep(250); }
+    if (!o.link && o.role === 'admin' && !(o.noLink && Date.now() - o.noLink < 7 * DAY)) {   // ~450 invite-code requests for groups you cannot admin was the heaviest part of the sync
+      try { const code = await sock.groupInviteCode(x.id); if (code) o.link = 'https://chat.whatsapp.com/' + code; else o.noLink = Date.now(); } catch { o.noLink = Date.now(); }
+      await sleep(700);
+    }
   }
   save(uid, 'groups', G); save(uid, 'contacts', C);
   await cleanContacts(uid).catch(() => {});
