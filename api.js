@@ -99,6 +99,15 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
     if (early instanceof Error) throw E(400, early.message);
     run.catch(() => {}); return { started: true };
   };
+  let lastBroadcast = 0;
+  const SETN = { limit: [1, 10000], maxAud: [1, 100000], batch: [1, 1000], trial: [0, 3650], refDays: [0, 365], spamMaxLinks: [0, 20], reachMax: [1, 50], msgDailyCap: [1, 2000], msgMaxRecipients: [1, 1000] };
+  const SETT = { payLink: 500, bank: 500, spamWords: 1000 }, SETB = ['require', 'kbPinned', 'autoRepair', 'spamGuard'];
+  const planClean = (b, partial) => {
+    const o = {}, S2 = (k, n) => { if (b[k] !== undefined) o[k] = String(b[k] ?? '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, n); };
+    S2('name', 30); S2('price', 30); S2('link', 500); S2('bank', 500);
+    if (b.days !== undefined) { const n = Number(b.days); if (!Number.isInteger(n) || n < 1 || n > 3650) throw E(400, 'Days must be a whole number from 1 to 3650.'); o.days = n; }
+    if (!partial && (!o.name || !o.price || !o.days)) throw E(400, 'A plan needs a name, a price and a number of days.'); if (partial && 'name' in o && !o.name) throw E(400, 'The name cannot be empty.'); return o;
+  };
   const unsending = new Set(), checking = new Set(), GRP = /^[A-Za-z0-9]{18,26}$/;
   const csvCell = v => `"${String(v ?? '').replace(/"/g, '""')}"`, toCsv = rows => '\uFEFF' + rows.map(r => r.map(csvCell).join(',')).join('\r\n');
   const sendFile = async (uid, text, name, cap) => { try { await bot.sendFile(uid, text, name, cap); } catch { throw E(502, 'Could not send the file to your chat. Open the bot and send /start first.'); } };
@@ -130,7 +139,7 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
           scheduledPosts: W.load(uid, 'posts', []).filter(x => x.status === 'scheduled').length, scheduledMessages: W.load(uid, 'msgs', []).filter(x => x.status === 'scheduled').length,
           lists: Object.keys(W.load(uid, 'lists', {})).length + Object.keys(W.load(uid, 'grouplists', {})).length
         },
-        features: { post: canSee(uid, '✍️ Post'), schedule: canSee(uid, '🗓 Schedule a post'), messages: canSee(uid, '✉️ Messages'), sending: canSee(uid, '📡 Sending now'), lists: canSee(uid, '🏷 Lists'), glists: canSee(uid, '📚 Group lists'), inbox: canSee(uid, '📩 Inbox'), tpl: canSee(uid, '📋 My templates'), links: canSee(uid, '🔗 Group links'), deadl: canSee(uid, '🧾 Review dead links'), clean: canSee(uid, '🧹 Clean dead links'), exportn: canSee(uid, '📤 Export numbers'), dedupe: canSee(uid, '🧹 Fix duplicates'), admin: canSee(uid, '🛠 Admin'), au: canSee(uid, '📋 List users'), ap: canSee(uid, '🕒 Pending'), contacts: canSee(uid, '📈 Summary'), reach: canSee(uid, '📊 Reach-out stats'), queue: canSee(uid, '🗂 Queue many'), col: canSee(uid, '⭐ Saved colours'), unsend: canSee(uid, '🗑 Delete a sent post'), media: canSee(uid, '🖼 Image'), ref: canSee(uid, '🎁 Refer a friend'), groups: canSee(uid, '👪 Groups & links'), excl: canSee(uid, '🚫 Exclusions'), plan: canSee(uid, '💳 Plan'), insights: canSee(uid, '📊 Insights') }
+        features: { post: canSee(uid, '✍️ Post'), schedule: canSee(uid, '🗓 Schedule a post'), messages: canSee(uid, '✉️ Messages'), sending: canSee(uid, '📡 Sending now'), lists: canSee(uid, '🏷 Lists'), glists: canSee(uid, '📚 Group lists'), inbox: canSee(uid, '📩 Inbox'), tpl: canSee(uid, '📋 My templates'), aset: canSee(uid, '🔢 Default limit'), afeat: canSee(uid, '🌐 Default features'), ufeat: canSee(uid, '🧑 User features'), apl: canSee(uid, '📖 List plans'), abc: canSee(uid, '📢 Broadcast'), anot: canSee(uid, '📌 Pin notice'), ares: canSee(uid, '📊 Results'), ain: canSee(uid, '📥 Admin inbox'), arep: canSee(uid, '↩️ Reply user'), links: canSee(uid, '🔗 Group links'), deadl: canSee(uid, '🧾 Review dead links'), clean: canSee(uid, '🧹 Clean dead links'), exportn: canSee(uid, '📤 Export numbers'), dedupe: canSee(uid, '🧹 Fix duplicates'), admin: canSee(uid, '🛠 Admin'), au: canSee(uid, '📋 List users'), ap: canSee(uid, '🕒 Pending'), contacts: canSee(uid, '📈 Summary'), reach: canSee(uid, '📊 Reach-out stats'), queue: canSee(uid, '🗂 Queue many'), col: canSee(uid, '⭐ Saved colours'), unsend: canSee(uid, '🗑 Delete a sent post'), media: canSee(uid, '🖼 Image'), ref: canSee(uid, '🎁 Refer a friend'), groups: canSee(uid, '👪 Groups & links'), excl: canSee(uid, '🚫 Exclusions'), plan: canSee(uid, '💳 Plan'), insights: canSee(uid, '📊 Insights') }
       };
     },
     'GET /api/posts': uid => {
@@ -293,6 +302,76 @@ export function startApi({ port = 3000, origins = [], token, W, canSee, isAdm, b
       else if (kind === 'dead') { need(uid, '🧾 Review dead links'); head = ['Link', 'Group', 'Found dead on']; name = 'dead-links.csv'; rows = deadLinks(uid).map(x => [x.url, x.where, fmtD(x.at)]); }
       else throw E(400, 'Unknown list.'); if (!rows.length) throw E(400, 'There is nothing to send yet.');
       await sendFile(uid, toCsv([head, ...rows]), name, `🔗 ${rows.length} links`); return { ok: true, total: rows.length };
+    },
+    'GET /api/admin/plans': uid => {
+      need(uid, '📖 List plans');
+      return { plans: W.load('_g', 'plans', []).map(p => ({ id: String(p.id), name: p.name || '', price: p.price || '', days: p.days || 0, link: p.link || '', bank: p.bank || '' })), can: { add: canSee(uid, '➕ Add plan'), edit: canSee(uid, '✏️ Edit plan'), del: canSee(uid, '🗑 Remove plan') } };
+    },
+    'POST /api/admin/plans': (uid, _p, b) => {
+      need(uid, '➕ Add plan'); const L = W.load('_g', 'plans', []); if (L.length >= 30) throw E(400, 'You can have up to 30 plans.');
+      L.push({ ...{ link: '', bank: '' }, ...planClean(b, false), id: Date.now() }); W.save('_g', 'plans', L); W.logActivity(uid, 'app-plan-add', String(b.name || '')); return { ok: true };
+    },
+    'POST /api/admin/plans/edit': (uid, _p, b) => {
+      need(uid, '✏️ Edit plan'); const L = W.load('_g', 'plans', []), p = L.find(x => String(x.id) === String(b.id)); if (!p) throw E(404, 'That plan no longer exists.');
+      Object.assign(p, planClean(b, true)); W.save('_g', 'plans', L); W.logActivity(uid, 'app-plan-edit', String(p.id)); return { ok: true };
+    },
+    'POST /api/admin/plans/delete': (uid, _p, b) => {
+      need(uid, '🗑 Remove plan'); const L = W.load('_g', 'plans', []), n = L.length, next = L.filter(x => String(x.id) !== String(b.id)); if (next.length === n) throw E(404, 'That plan no longer exists.');
+      W.save('_g', 'plans', next); W.logActivity(uid, 'app-plan-remove', String(b.id)); return { ok: true };
+    },
+    'GET /api/admin/audience': uid => { need(uid, '📢 Broadcast'); return { all: bot.audienceCount('all'), active: bot.audienceCount('active'), live: bot.audienceCount('live') }; },
+    'POST /api/admin/broadcast': (uid, _p, b) => {
+      need(uid, '📢 Broadcast'); const text = String(b.text ?? '').trim(); if (!text) throw E(400, 'The broadcast cannot be empty.'); if (text.length > 4000) throw E(400, 'Keep it under 4000 characters.');
+      if (Date.now() - lastBroadcast < 60000) throw E(429, 'A broadcast was just sent. Wait a minute before sending another.'); lastBroadcast = Date.now();
+      const aud = ['all', 'active', 'live'].includes(b.aud) ? b.aud : 'all', n = bot.broadcast(Number(uid), text, aud); W.logActivity(uid, 'app-broadcast', aud, `${n} users`); return { started: true, recipients: n };
+    },
+    'POST /api/admin/notice': (uid, _p, b) => {
+      need(uid, '📌 Pin notice'); const text = String(b.text ?? '').trim().slice(0, 4000); if (!text) throw E(400, 'The notice cannot be empty.');
+      const n = bot.pinNotice(Number(uid), text); W.logActivity(uid, 'app-pin-notice', '', `${n} users`); return { started: true, recipients: n };
+    },
+    'GET /api/admin/campaigns': uid => { need(uid, '📊 Results'); return { items: bot.campaigns() }; },
+    'GET /api/admin/inbox': uid => {
+      need(uid, '📥 Admin inbox'); const P = id => W.prof(String(id)).name || '';
+      return { items: W.load('_g', 'admin_inbox', []).slice(-30).reverse().map(x => ({ uid: String(x.uid), name: P(x.uid), text: String(x.text || ''), at: x.at || 0, replied: !!x.replied })), can: canSee(uid, '↩️ Reply user') };
+    },
+    'POST /api/admin/reply': async (uid, _p, b) => {
+      need(uid, '↩️ Reply user'); const t = String(b.uid || ''), text = String(b.text ?? '').trim().slice(0, 4000);
+      if (!/^\d{1,20}$/.test(t) || !W.users().includes(t)) throw E(404, 'That user was not found.'); if (!text) throw E(400, 'Write a reply first.');
+      try { await bot.replyUser(t, text); } catch { throw E(400, 'Could not deliver the reply. The user may have blocked the bot.'); }
+      const inbox = W.load('_g', 'admin_inbox', []), item = [...inbox].reverse().find(x => String(x.uid) === t && !x.replied); if (item) item.replied = true; W.save('_g', 'admin_inbox', inbox);
+      W.logActivity(uid, 'app-reply-user', t); return { ok: true };
+    },
+    'GET /api/admin/settings': uid => {
+      need(uid, '🔢 Default limit'); const C = W.CFG, v = {};
+      for (const k of Object.keys(SETN)) v[k] = Number(C[k] ?? 0); for (const k of Object.keys(SETT)) v[k] = String(C[k] ?? '');
+      v.remindDays = String(C.remindDays ?? ''); v.require = !!C.require; v.kbPinned = C.kbPinned !== false; v.autoRepair = C.autoRepair !== false; v.spamGuard = C.spamGuard !== false;
+      return { values: v, payProvider: String(W.payProvider?.() || ''), paySecretSet: !!(W.onlinePayOn?.() || C.paySecret) };
+    },
+    'POST /api/admin/settings': (uid, _p, b) => {
+      need(uid, '🔢 Default limit'); const k = String(b.key || '');
+      if (has(SETN, k)) {
+        const n = Number(b.value), [lo, hi] = SETN[k]; if (!Number.isInteger(n) || n < lo || n > hi) throw E(400, `Enter a whole number from ${lo} to ${hi}.`);
+        W.setCfg(k, n); W.logActivity(uid, 'setting', k, String(n));
+      } else if (has(SETT, k)) {
+        const raw = String(b.value ?? '').replace(/[\u0000-\u0008\u000b-\u001f]/g, ' ').trim(); if (raw.length > SETT[k]) throw E(400, `Keep it under ${SETT[k]} characters.`);
+        W.setCfg(k, raw === '-' ? '' : raw); W.logActivity(uid, 'setting', k, '');
+      } else if (k === 'remindDays') {
+        const list = String(b.value ?? '').split(',').map(x => Number(x.trim())); if (!list.length || list.some(n => !Number.isInteger(n) || n < 1 || n > 60)) throw E(400, 'Use whole days from 1 to 60 separated by commas, for example 3,1.');
+        W.setCfg('remindDays', list.join(',')); W.logActivity(uid, 'setting', k, list.join(','));
+      } else if (SETB.includes(k)) { W.setCfg(k, !!b.value); W.logActivity(uid, 'setting', k, b.value ? 'on' : 'off'); }
+      else throw E(400, 'Unknown setting.');
+      return { ok: true };
+    },
+    'GET /api/admin/features': (uid, _p, _b, q) => {
+      const t = String(q.get('user') || ''); need(uid, t ? '🧑 User features' : '🌐 Default features');
+      if (t && (!/^\d{1,20}$/.test(t) || !W.users().includes(t))) throw E(404, 'That user was not found.');
+      return { target: t, name: t ? W.prof(t).name || '' : '', features: bot.featList(t || null) };
+    },
+    'POST /api/admin/features': (uid, _p, b) => {
+      const t = String(b.user || ''); need(uid, t ? '🧑 User features' : '🌐 Default features');
+      if (t && (!/^\d{1,20}$/.test(t) || !W.users().includes(t))) throw E(404, 'That user was not found.');
+      if (b.reset) { if (!t) throw E(400, 'Pick a user to reset.'); bot.featReset(t); W.logActivity(uid, 'feat-reset', t); return { ok: true }; }
+      if (!bot.featSet(t || null, String(b.key || ''), !!b.on)) throw E(400, 'Unknown feature.'); W.logActivity(uid, 'feat-toggle', t || 'everyone', `${b.key} -> ${b.on ? 'on' : 'off'}`); return { ok: true };
     },
     'GET /api/templates': uid => {
       need(uid, '📋 My templates');

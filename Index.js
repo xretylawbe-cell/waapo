@@ -148,11 +148,11 @@ for (const [p, labels] of Object.entries({
   plans: ['🗂 Manage plans', '➕ Add plan', '✏️ Edit plan', '🗑 Remove plan', '📖 List plans'],
   settings: ['⚙️ Settings', '💳 Pay link', '🏦 Bank details', '🔢 Default limit', '👥 Max audience', '📦 Batch size', '⏳ Trial days', '🧪 Toggle plan required', '📌 Pinned keyboard', '🌈 Button colours', '🤖 Auto session repair', '⏰ Reminder days', '🎁 Referral days', '🌐 Online payments', '🔑 Payment key', '🛡 Spam guard', '🔗 Max links per post', '🚫 Spam words', '📣 Reach-out max/day', '✉️ Message daily cap', '👥 Message max recipients'],
   features: ['🧩 Features', '🌐 Default features', '🧑 User features'],
-  running: ['📡 All sending'], deleted: ['🗄 Deleted accounts'], backup: ['💾 Backup now'],
+  running: ['📡 All sending'], deleted: ['🗄 Deleted accounts'], backup: ['💾 Backup now', '♻️ Restore backup'],
   sessions: ['🔌 Force unlink', '🧽 Repair user'],
   logs: ['🧾 Activity log']
 })) for (const l of labels) PERM_OF[l] = p;
-const OWNER_ONLY = new Set(['👮 Admins', '➕ Add admin', '➖ Remove admin', '📖 List admins', '🔐 Admin access']);
+const OWNER_ONLY = new Set(['♻️ Restore backup', '👮 Admins', '➕ Add admin', '➖ Remove admin', '📖 List admins', '🔐 Admin access']);
 const permList = id => load('_g', 'admin_perms', {})[String(id)];
 const permOn = (u, k) => W.isOwner(u) || (permList(u) ?? Object.keys(PERMS)).includes(k);   // admins with no saved list keep full access
 const featState = (target, k) => { const g = load('_g', 'features', {})[k] ?? FEATURES[k].def; return target ? (prof(target).feat?.[k] ?? g) : g; };
@@ -193,7 +193,7 @@ const MENUS = {
   plan: { t: '💳 Plan', rows: () => [['📄 My plan', '🛒 Choose a plan'], ['🧾 Send receipt', '🎁 Refer a friend']] },
   inbox: { t: '📩 Inbox', rows: () => [['📌 Notices', '✉️ Message admin']] },
   account: { t: '⚙️ Account', rows: () => [['ℹ️ Status', '🔔 Toggle alerts'], ['📰 Toggle weekly report', '🧹 Toggle auto-prune'], ['🧽 Repair session'], ['🔌 Unlink', '🗑 Delete account']] },
-  admin: { t: '🛠 Admin', rows: () => [['👤 Users', '📂 User data'], ['📢 Messages', '💰 Payments'], ['🗂 Manage plans', '🧩 Features'], ['⚙️ Settings', '📡 All sending'], ['🗄 Deleted accounts', '💾 Backup now'], ['🧾 Activity log', '👮 Admins']] },
+  admin: { t: '🛠 Admin', rows: () => [['👤 Users', '📂 User data'], ['📢 Messages', '💰 Payments'], ['🗂 Manage plans', '🧩 Features'], ['⚙️ Settings', '📡 All sending'], ['🗄 Deleted accounts', '💾 Backup now'], ['♻️ Restore backup'], ['🧾 Activity log', '👮 Admins']] },
   features: { t: '🧩 Features', rows: () => [['🌐 Default features', '🧑 User features']] },
   settings: { t: '⚙️ Settings (live — no code edits)', rows: u => [['💳 Pay link', '🏦 Bank details'], ['🔢 Default limit', '👥 Max audience'], ['📦 Batch size', '⏳ Trial days'], ['🧪 Toggle plan required'], ['📌 Pinned keyboard', '🌈 Button colours'], ['🤖 Auto session repair', '⏰ Reminder days'], ['🎁 Referral days', '🌐 Online payments'], ['🔑 Payment key', '🛡 Spam guard'], ['🔗 Max links per post', '🚫 Spam words'], ['📣 Reach-out max/day', '✉️ Message daily cap'], ['👥 Message max recipients']] },
   admins: { t: '👮 Admins', rows: () => [['➕ Add admin', '➖ Remove admin'], ['🔐 Admin access', '📖 List admins']] },
@@ -277,7 +277,7 @@ hooks.planActive = (uid, text) => { const us = St(Number(uid)); us.nav = ['home'
 hooks.adminNote = text => { for (const a of W.adminList()) if (W.isOwner(a) || permOn(a, 'payments')) tg.sendMessage(a, text, { parse_mode: 'HTML' }).catch(() => {}); };
 hooks.expired = uid => tg.sendMessage(uid, '⌛ <b>Your plan has expired.</b> Open 💳 Plan to renew.', { parse_mode: 'HTML', ...keyboardFor(uid) }).catch(() => {});
 hooks.report = (uid, t) => tg.sendMessage(uid, t, { parse_mode: 'HTML', ...keyboardFor(uid) }).catch(() => {});
-hooks.backup = f => CFG.admin && tg.sendDocument(CFG.admin, { source: f, filename: 'sessions-backup.tgz' }).catch(() => {});
+hooks.backup = f => CFG.admin && tg.sendDocument(CFG.admin, { source: f, filename: f.endsWith('.enc') ? 'sessions-backup.tgz.enc' : 'sessions-backup.tgz' }, { caption: '🔐 Nightly backup of every WhatsApp login. Keep it private. To restore: Admin → ♻️ Restore backup.' }).catch(() => tg.sendMessage(CFG.admin, '⚠️ Tonight\'s backup could not be sent to Telegram (the file may be over 50 MB). It is saved on the server.').catch(() => {}));
 
 // ---------- colours ----------
 function askColor(ctx, s, which, page = '1') {
@@ -1130,10 +1130,33 @@ A['💾 Backup now'] = async ctx => {
   const dir = fs.mkdtempSync(`${os.tmpdir()}/wa-status-backup-`), archive = `${dir}/backup.tgz`;
   try {
     execFileSync('tar', ['-czf', archive, W.DATA], { timeout: 120000 });
-    await ctx.replyWithDocument({ source: archive, filename: 'wa-status-backup.tgz' });
+    const enc = !!W.backupKey(); if (enc) W.encryptFile(archive, `${archive}.enc`, W.backupKey());
+    await ctx.replyWithDocument({ source: enc ? `${archive}.enc` : archive, filename: enc ? 'wa-status-backup.tgz.enc' : 'wa-status-backup.tgz' }, { caption: `🔐 Everything: logins, schedules, contacts, settings.${enc ? ' Encrypted with your BACKUP_KEY.' : ' Not encrypted: set BACKUP_KEY in .env to encrypt it.'} Keep it private.` });
   } catch (e) { await out(ctx, `❌ Backup failed: ${esc(e.message)}`); }
   finally { fs.rmSync(dir, { recursive: true, force: true }); }
 };
+A['♻️ Restore backup'] = async ctx => {
+  if (!W.isOwner(ctx.from.id)) return out(ctx, 'Only the owner can restore a backup.');
+  return ask(ctx, St(ctx.from.id), 'restore', '♻️ Send the backup file here as a file (.tgz, or .enc if you encrypt backups).\n\n• Only people who are NOT linked right now get their login restored, so nobody is rolled back.\n• Existing files are never overwritten.\n• Telegram lets me download files up to 20 MB.\n• Add the word force as the caption to overwrite everything. Use that only on a fresh server.');
+};
+async function restoreDoc(ctx) {
+  const u = ctx.from.id, m = ctx.message, d = m.document;
+  if (!W.isOwner(u)) return out(ctx, 'Only the owner can restore a backup.');
+  if (!d) return out(ctx, 'Please send the backup as a file (a document), not as a photo or text.');
+  if (d.file_size > 19.5e6) return out(ctx, '❌ This file is over 20 MB and Telegram does not let bots download that much. Restore it by hand: stop the bot, unpack it into the data folder, then start the bot again.');
+  const force = /\bforce\b/i.test(m.caption || ''), tmp = fs.mkdtempSync(`${os.tmpdir()}/wa-restore-in-`), raw = `${tmp}/in`, plain = `${tmp}/out.tgz`;
+  ctx.deleteMessage().catch(() => {});                              // the file holds everyone's logins
+  await out(ctx, '♻️ Restoring… this can take a minute.');
+  try {
+    const url = await tg.getFileLink(d.file_id); fs.writeFileSync(raw, Buffer.from(await (await fetch(url.href)).arrayBuffer()));
+    let file = raw;
+    if (W.isEncrypted(raw)) { if (!W.backupKey()) throw new Error('This backup is encrypted. Set BACKUP_KEY in your .env to the same key, restart the bot, and send it again.'); W.decryptFile(raw, plain, W.backupKey()); file = plain; }
+    const r = await W.restoreBackup(file, { force }); St(u).step = null;
+    W.logActivity(u, 'backup-restore', `${r.restored.length} logins, ${r.data} files${force ? ', force' : ''}`);
+    return out(ctx, ['✅ Restore finished', '', `🔐 Logins restored: ${r.restored.length} (they reconnect now, one by one)`, `⏭ Kept as they are (already linked here): ${r.kept.length}`, `📂 Data files restored: ${r.data}`, r.notPaired ? `ℹ️ Logins in the backup that were not linked: ${r.notPaired}` : '', r.failed ? `⚠️ Failed: ${r.failed}` : '', '', 'A login can be a few hours older than the live one. If someone does not reconnect, ask them to link again.'].filter(x => x !== '').join('\n'));
+  } catch (e) { return out(ctx, `❌ ${esc(e.message)}`); }
+  finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+}
 A['🗄 Deleted accounts'] = ctx => {
   if (!requireAdmin(ctx)) return;
   const dir = `${W.DATA}/deleted`, entries = fs.existsSync(dir) ? fs.readdirSync(dir).slice(-50) : [];
@@ -1753,6 +1776,7 @@ bot.on('message', ctx => {
   const s = St(ctx.from.id);
   if (s.step === 'receipt') return receipt(ctx).catch(e => out(ctx, `❌ ${esc(e.message)}`));
   if (s.step === 'msgadm') return out(ctx, 'Please send your message as text.');
+  if (s.step === 'restore') return restoreDoc(ctx);
   if (!['pmedia', 'queue', 'mmedia'].includes(s.step)) return;
   return (async () => {
     const u = ctx.from.id, m = ctx.message;
@@ -1809,7 +1833,16 @@ function main() {
     const ping = () => fetch(process.env.PROXY_URL.replace(/\/$/, '') + '/healthz', { signal: AbortSignal.timeout(20000) }).catch(() => {});
     ping(); setInterval(ping, 9 * 60e3).unref();
   }
-  if (process.env.MINIAPP_ORIGIN) startApi({ port: Number(process.env.MINIAPP_PORT || 3000), origins: process.env.MINIAPP_ORIGIN.split(',').map(x => x.trim().replace(/\/$/, '')).filter(Boolean), token: CFG.token, W, canSee, isAdm, build: BUILD, bot: { sendFile: (uid, text, filename, caption) => tg.sendDocument(uid, { source: Buffer.from(text || '—'), filename }, caption ? { caption } : {}), approvedNotice: (uid, planName, n) => { const us = St(Number(uid)); us.nav = ['home']; us.keyboardRows = MENUS.home.rows(Number(uid)); return tg.sendMessage(uid, `🎉 Payment approved! ${planName ? esc(planName) + ' plan: ' : ''}${n} days added. Your dashboard is updated ↓`, { parse_mode: 'HTML', ...keyboardFor(Number(uid)) }).catch(() => {}); }, declinedNotice: uid => tg.sendMessage(uid, '❌ Your payment receipt was declined. Contact the admin if you need help.').catch(() => {}), reachMax: () => Number(CFG.reachMax ?? 10), hasAdmin: () => !!CFG.admin, notifyAdmin: text => tg.sendMessage(CFG.admin, text, { parse_mode: 'HTML' }), esc, refDays: () => Number(CFG.refDays ?? 7), refLink: u => botUser ? `https://t.me/${botUser}?start=ref_${Number(u).toString(36)}` : '' } });
+  if (process.env.MINIAPP_ORIGIN) startApi({ port: Number(process.env.MINIAPP_PORT || 3000), origins: process.env.MINIAPP_ORIGIN.split(',').map(x => x.trim().replace(/\/$/, '')).filter(Boolean), token: CFG.token, W, canSee, isAdm, build: BUILD, bot: {
+    featList: target => Object.entries(FEATURES).map(([k, f]) => ({ k, name: f.name, on: !!featState(target, k), custom: !!target && prof(target).feat?.[k] !== undefined })),
+    featSet: (target, k, on) => { if (!FEATURES[k]) return false; if (target) { const p = prof(target); p.feat = { ...(p.feat || {}), [k]: !!on }; save(target, 'profile', p); } else { const g = load('_g', 'features', {}); g[k] = !!on; save('_g', 'features', g); } refreshMenus(); return true; },
+    featReset: target => { const p = prof(target); delete p.feat; save(target, 'profile', p); refreshMenus(); },
+    audienceCount: k => audienceOf(k).length,
+    broadcast: (adminId, text, aud) => { const uids = audienceOf(aud), ctx = { from: { id: adminId }, chat: { id: adminId }, reply: (t, e) => tg.sendMessage(adminId, t, e) }; void runCampaign(ctx, newCampaign(ctx, { kind: 'message', text: text.slice(0, 4000) }), uids); return uids.length; },
+    campaigns: () => campaigns().slice(-10).reverse().map(c => ({ id: c.id, kind: c.kind, at: c.at, title: String(c.kind === 'poll' ? c.question : c.text).slice(0, 80), sent: c.sent, failed: c.failed, closed: !!c.closed, report: campaignReport(c).replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&') })),
+    pinNotice: (adminId, text) => { const n = load('_g', 'notices', []); n.push({ text, at: Date.now() }); save('_g', 'notices', n.slice(-50)); const uids = users(); void (async () => { let sent = 0; for (const uid of uids) { try { const m = await tg.sendMessage(uid, `📌 ${text}`); await tg.pinChatMessage(uid, m.message_id, { disable_notification: true }).catch(() => {}); sent++; } catch {} await wait(45); } tg.sendMessage(adminId, `📌 Notice delivered to ${sent} user${sent === 1 ? '' : 's'}.`).catch(() => {}); })(); return uids.length; },
+    replyUser: (uid, text) => tg.sendMessage(uid, `📩 Reply from admin:\n${text}`),
+    sendFile: (uid, text, filename, caption) => tg.sendDocument(uid, { source: Buffer.from(text || '—'), filename }, caption ? { caption } : {}), approvedNotice: (uid, planName, n) => { const us = St(Number(uid)); us.nav = ['home']; us.keyboardRows = MENUS.home.rows(Number(uid)); return tg.sendMessage(uid, `🎉 Payment approved! ${planName ? esc(planName) + ' plan: ' : ''}${n} days added. Your dashboard is updated ↓`, { parse_mode: 'HTML', ...keyboardFor(Number(uid)) }).catch(() => {}); }, declinedNotice: uid => tg.sendMessage(uid, '❌ Your payment receipt was declined. Contact the admin if you need help.').catch(() => {}), reachMax: () => Number(CFG.reachMax ?? 10), hasAdmin: () => !!CFG.admin, notifyAdmin: text => tg.sendMessage(CFG.admin, text, { parse_mode: 'HTML' }), esc, refDays: () => Number(CFG.refDays ?? 7), refLink: u => botUser ? `https://t.me/${botUser}?start=ref_${Number(u).toString(36)}` : '' } });
   // Telegraf's launch promise remains pending for as long as polling runs.
   // Use its onLaunch callback for startup work instead of awaiting that promise.
   bot.launch({ allowedUpdates: ['message', 'edited_message', 'callback_query', 'my_chat_member', 'poll', 'poll_answer', 'message_reaction'] }, () => {

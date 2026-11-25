@@ -1,7 +1,8 @@
 // core.js — WhatsApp engine, data layer, posting, jobs. UI lives in index.js
 import fs from 'node:fs';
 import os from 'node:os';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
+import nodeCrypto from 'node:crypto';
 import pino from 'pino';
 import QRCode from 'qrcode';
 import makeWASocket, { makeCacheableSignalKeyStore, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, generateWAMessage } from '@whiskeysockets/baileys';
@@ -191,6 +192,7 @@ export async function connect(uid, mode = 'resume', phone = '') {
   sock.ev.on('creds.update', saveCreds);
   // WhatsApp now sends contacts' statuses as a top-level <status> stanza that Baileys never acknowledges; ~50 min later the server drops the stream (500 "Stream Errored (ack)"). Acknowledge it ourselves (Baileys issue #2858).
   sock.ws?.on?.('CB:status', node => {
+    if (process.env.WA_STATUS_ACK === 'off' || isYoung(uid)) return;   // a brand-new linked device gets a burst of old statuses: do not answer them all by hand in the first hour (WA_STATUS_ACK=off disables this workaround completely, for testing)
     try {
       const a = node?.attrs || {}; if (!a.id) return;
       const ack = { tag: 'ack', attrs: { id: a.id, class: 'status' } };
@@ -734,7 +736,61 @@ export function makeBackup() {                                    // sessions on
   const dirs = users().filter(u => fs.existsSync(`${DATA}/${u}/auth`)).map(u => `${u}/auth`);
   if (!dirs.length) return null;
   execSync(`tar -czf ${DATA}/.b.tmp -C ${DATA} ${dirs.join(' ')}`); fs.renameSync(`${DATA}/.b.tmp`, `${DATA}/sessions-backup.tgz`);
-  return `${DATA}/sessions-backup.tgz`;
+  const plain = `${DATA}/sessions-backup.tgz`; if (!backupKey()) return plain;
+  encryptFile(plain, `${plain}.enc`, backupKey()); fs.rmSync(plain, { force: true }); return `${plain}.enc`;   // BACKUP_KEY set: the file on disk and the one sent to you are encrypted
+}
+
+// ---------- encrypted backups + restore ----------
+const MAGIC = Buffer.from('WAAPOBK1');
+export const backupKey = () => String(E.BACKUP_KEY || '');
+export const isEncrypted = f => { try { const fd = fs.openSync(f, 'r'), b = Buffer.alloc(8); fs.readSync(fd, b, 0, 8, 0); fs.closeSync(fd); return b.equals(MAGIC); } catch { return false; } };
+export function encryptFile(src, dst, pass) {
+  const salt = nodeCrypto.randomBytes(16), iv = nodeCrypto.randomBytes(12), c = nodeCrypto.createCipheriv('aes-256-gcm', nodeCrypto.scryptSync(pass, salt, 32), iv);
+  const enc = Buffer.concat([c.update(fs.readFileSync(src)), c.final()]); fs.writeFileSync(dst, Buffer.concat([MAGIC, salt, iv, c.getAuthTag(), enc]));
+}
+export function decryptFile(src, dst, pass) {
+  const b = fs.readFileSync(src); if (!b.subarray(0, 8).equals(MAGIC)) throw new Error('This is not an encrypted Waapo backup.');
+  try {
+    const d = nodeCrypto.createDecipheriv('aes-256-gcm', nodeCrypto.scryptSync(pass, b.subarray(8, 24), 32), b.subarray(24, 36)); d.setAuthTag(b.subarray(36, 52));
+    fs.writeFileSync(dst, Buffer.concat([d.update(b.subarray(52)), d.final()]));
+  } catch { throw new Error('Could not open this backup. The BACKUP_KEY is wrong, or the file is damaged.'); }
+}
+const isDirL = p => { try { return fs.lstatSync(p).isDirectory(); } catch { return false; } };
+function findRoot(dir, depth) {                                    // the folder that holds the numbered user folders, wherever the archive put it
+  let names; try { names = fs.readdirSync(dir); } catch { return null; } if (names.some(n => /^\d{1,20}$/.test(n) && isDirL(`${dir}/${n}`))) return dir; if (depth >= 5) return null;
+  for (const n of names) if (isDirL(`${dir}/${n}`)) { const r = findRoot(`${dir}/${n}`, depth + 1); if (r) return r; } return null;
+}
+// Puts a backup back on this server. Safe by default: nobody who is already linked is rolled back, and existing files are never overwritten (force = true overrides, for a fresh server).
+export async function restoreBackup(file, { force = false } = {}) {
+  const T = { encoding: 'utf8', maxBuffer: 256e6, timeout: 120000 };
+  const kinds = execFileSync('tar', ['-tvzf', file], T).split('\n').filter(Boolean), names = execFileSync('tar', ['-tzf', file], T).split('\n').filter(Boolean);
+  if (!names.length) throw new Error('This backup is empty.');
+  if (kinds.some(l => !/^[-d]/.test(l))) throw new Error('This backup contains links or special files, so it was refused.');
+  if (names.some(n => n.startsWith('/') || n.split('/').includes('..'))) throw new Error('This backup has unsafe file paths, so it was refused.');
+  const tmp = fs.mkdtempSync(`${os.tmpdir()}/wa-restore-`), res = { restored: [], kept: [], notPaired: 0, data: 0, failed: 0 };
+  try {
+    execFileSync('tar', ['-xzf', file, '-C', tmp, '--no-same-owner', '--no-same-permissions'], T);
+    const root = findRoot(tmp, 0); if (!root) throw new Error('No user logins or data were found in this backup.');
+    const copyJson = (id, dir) => { for (const f of fs.readdirSync(dir)) {
+      if (!/^[A-Za-z0-9_-]+\.json$/.test(f) || isDirL(`${dir}/${f}`)) continue; const dst = `${udir(id)}/${f}`; if (!force && fs.existsSync(dst)) continue;
+      fs.copyFileSync(`${dir}/${f}`, dst); const k = `${id}/${f.slice(0, -5)}`; delete C[k]; dirty.delete(k); res.data++;      // forget the cached copy, or it would overwrite what we just restored
+    } };
+    if (isDirL(`${root}/_g`)) try { copyJson('_g', `${root}/_g`); } catch { res.failed++; }
+    for (const uid of fs.readdirSync(root).filter(n => /^\d{1,20}$/.test(n) && isDirL(`${root}/${n}`))) {
+      const src = `${root}/${uid}`;
+      try {
+        copyJson(uid, src);
+        if (!isDirL(`${src}/auth`)) continue;
+        let ok = false; try { ok = isPairedCreds(JSON.parse(fs.readFileSync(`${src}/auth/creds.json`))); } catch {}
+        if (!ok) { res.notPaired++; continue; }
+        if (!force && linked(uid)) { res.kept.push(uid); continue; }   // a live login on this server is newer than any backup
+        gen[uid] = (gen[uid] || 0) + 1; up[uid] = false; try { socks[uid]?.end?.(undefined); } catch {} delete socks[uid];
+        const dst = `${udir(uid)}/auth`; fs.rmSync(dst, { recursive: true, force: true }); fs.cpSync(`${src}/auth`, dst, { recursive: true }); res.restored.push(uid);
+      } catch { res.failed++; }
+    }
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  (async () => { for (const uid of res.restored) { connect(uid, 'resume').catch(() => {}); await sleep(300 + Math.random() * 400); } })();   // bring the restored logins online, one by one
+  return res;
 }
 const ran = {}; let maintTimer;
 function maintenance() {
